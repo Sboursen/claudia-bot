@@ -1,0 +1,31 @@
+name: Codex Security dry run
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate Codex Security configuration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate configuration
+        id: security
+        uses: openai/codex-security@bf650710f36c16936324efe250a49cdd9f2da037 # action-v0.10.1
+        with:
+          scope: repository
+          mode: standard
+          dry-run: 'true'
+          fail-on-severity: none
+          verbose: 'false'
+          summary: 'false'
+          annotations: 'false'
+          upload-artifacts: 'false'
