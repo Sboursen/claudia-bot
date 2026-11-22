@@ -30,6 +30,7 @@ DEFAULT_MODEL = "bytedance/seedance-2.5"
 TERMINAL = ("completed", "failed", "cancelled", "canceled", "expired")
 SEEDANCE2_RE = re.compile(r"^bytedance/seedance-(2|[3-9])")
 AUDIO_PHRASE_RE = re.compile(r"(moving in time with) @Audio1", re.I)
+JOB_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._~-]{0,255}")
 
 
 def media_refs_ok(model: str) -> bool:
@@ -120,15 +121,26 @@ def estimate(model: str, body: dict, video_input_s: float = 0.0) -> float:
                               n_images=n_img)
 
 
+def validate_job_id(job_id: object) -> str:
+    if not isinstance(job_id, str) or not JOB_ID_RE.fullmatch(job_id):
+        raise ProviderError("Expected an OpenRouter video job ID", status="bad_request")
+    return job_id
+
+
 def submit(client: OpenRouter, body: dict) -> dict:
     r = client.post("/videos", body, retry_5xx=False, where="videos submit")
-    if not isinstance(r, dict) or not r.get("id"):
-        raise ProviderError(f"no job id in the response (not submitted, not billed): {str(r)[:300]}", status="error")
+    try:
+        validate_job_id(r.get("id") if isinstance(r, dict) else None)
+    except ProviderError:
+        raise ProviderError("OpenRouter returned a success response without a usable video job ID. "
+                            "Check OpenRouter activity before retrying.",
+                            status="unknown_outcome") from None
     return r
 
 
 def job_status(client: OpenRouter, job_id: str, polling_url: str | None = None) -> dict:
-    return client.get(polling_url or f"/videos/{job_id}", where="videos poll")
+    """Poll by job ID. The former polling URL argument is accepted for compatibility."""
+    return client.get(f"/videos/{validate_job_id(job_id)}", where="videos poll")
 
 
 def job_error(st: dict) -> tuple[str, str]:
@@ -140,7 +152,8 @@ def job_error(st: dict) -> tuple[str, str]:
 
 
 def download(client: OpenRouter, job_id: str, out: Path) -> Path:
-    raw = client.request("GET", f"/videos/{job_id}/content?index=0", raw=True, timeout=900, where="videos download")
+    raw = client.request("GET", f"/videos/{validate_job_id(job_id)}/content?index=0",
+                         raw=True, timeout=900, where="videos download", media_redirect=True)
     if not raw or len(raw) < 1000:
         raise ProviderError(f"the video download for {job_id} was empty — re-run slop clip poll", status="server")
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -148,11 +161,11 @@ def download(client: OpenRouter, job_id: str, out: Path) -> Path:
     return out
 
 
-def wait(client: OpenRouter, job_id: str, polling_url: str | None, max_s: float, sleep=time.sleep) -> dict:
+def wait(client: OpenRouter, job_id: str, polling_url: str | None = None, max_s: float = 0.0, sleep=time.sleep) -> dict:
     """poll with backoff 5 s ×1.4 up to 20 s until terminal or max_s elapsed (max_s 0 = one check)."""
     t_end = time.monotonic() + max_s; dly = 5.0
     while True:
-        st = job_status(client, job_id, polling_url)
+        st = job_status(client, job_id)
         if st.get("status") in TERMINAL or time.monotonic() + dly > t_end:
             return st
         sleep(dly); dly = min(20.0, dly * 1.4)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -12,6 +13,7 @@ _spec = importlib.util.spec_from_file_location("gen_test_helpers", _H)
 H = importlib.util.module_from_spec(_spec); sys.modules.setdefault("gen_test_helpers", H); _spec.loader.exec_module(H)
 
 from slop.config import SlopError  # noqa: E402
+from slop.gen import openrouter, video  # noqa: E402
 from slop.gen.openrouter import OpenRouter, ProviderError, classify, data_url, decode_data_url  # noqa: E402
 
 KEY = "sk-or-v1-test-not-a-real-key"
@@ -30,6 +32,103 @@ def test_headers_and_json():
     assert h["Authorization"] == f"Bearer {KEY}"
     assert h["HTTP-Referer"] == "claudia" and h["X-Title"] == "claudia" and h["User-Agent"].startswith("claudia/")
     assert c.session.calls[0]["url"] == "https://openrouter.ai/api/v1/key"
+    assert c.session.calls[0]["allow_redirects"] is False
+
+
+@pytest.mark.parametrize("url", [
+    "https://provider.invalid/api/v1/key",
+    "https://openrouter.ai:8443/api/v1/key",
+    "http://openrouter.ai/api/v1/key",
+])
+def test_authenticated_request_validates_destination_before_accessing_key(url, monkeypatch):
+    c, _ = client({})
+    monkeypatch.setattr(c, "key", lambda: pytest.fail("invalid destination reached the credential reader"))
+    with pytest.raises(ProviderError, match="HTTPS"):
+        c.get(url)
+    assert c.session.calls == []
+
+
+def test_custom_api_origin_requires_an_explicit_key(monkeypatch):
+    base = "https://provider.invalid/api/v1"
+    routes = {("GET", "/key"): H.FakeResp(200, {"ok": True})}
+    c = OpenRouter(session=H.FakeSession(routes), base=base)
+    monkeypatch.setattr(openrouter, "require_env", lambda *_: pytest.fail("custom origin requested the ambient key"))
+    with pytest.raises(ProviderError, match="explicit key"):
+        c.get("/key")
+    assert c.session.calls == []
+    c, _ = client(routes, base=base)
+    assert c.get("/key") == {"ok": True}
+    assert c.session.calls[0]["url"] == base + "/key"
+    assert c.session.calls[0]["headers"]["Authorization"] == f"Bearer {KEY}"
+
+
+def test_regular_redirect_cannot_issue_a_second_request():
+    c, _ = client({("GET", "/key"): H.FakeResp(302, headers={"Location": "https://storage.invalid/archive"})})
+    with pytest.raises(ProviderError, match="unexpected redirect"):
+        c.get("/key")
+    assert len(c.session.calls) == 1
+    assert c.session.calls[0]["allow_redirects"] is False
+
+
+def test_submit_redirect_preserves_unknown_paid_outcome():
+    c, _ = client({("POST", "/videos"): H.FakeResp(307, headers={"Location": "https://openrouter.ai/api/v1/archive"})})
+    with pytest.raises(ProviderError) as exc_info:
+        video.submit(c, {"model": "fixture"})
+    assert exc_info.value.status == "unknown_outcome"
+    assert len(c.session.calls) == 1
+
+
+@pytest.mark.parametrize("envelope", [
+    {}, {"id": None}, {"id": ""}, {"id": 1}, {"id": "invalid job ID"}, [],
+])
+def test_successful_video_submit_without_usable_job_id_preserves_unknown_outcome(envelope):
+    c, _ = client({("POST", "/videos"): H.FakeResp(202, envelope)})
+    with pytest.raises(ProviderError, match="usable video job ID") as exc_info:
+        video.submit(c, {"model": "fixture"})
+    assert exc_info.value.status == "unknown_outcome"
+    assert len(c.session.calls) == 1
+
+
+def test_paid_post_with_unreadable_success_response_preserves_unknown_outcome():
+    c, _ = client({("POST", "/images"): H.FakeResp(200, content=b"unreadable fixture response")})
+    with pytest.raises(ProviderError, match="response was not JSON") as exc_info:
+        c.post("/images", {"model": "fixture"}, retry_network=False)
+    assert exc_info.value.status == "unknown_outcome"
+    assert len(c.session.calls) == 1
+
+
+def test_polling_uses_the_provider_path_for_a_legacy_take():
+    c, _ = client({("GET", "/videos/gen-vid-fixture"): H.FakeResp(200, {"status": "completed"})})
+    assert video.wait(c, "gen-vid-fixture", "https://openrouter.ai/api/v1/legacy", 0) == {"status": "completed"}
+    assert c.session.calls[0]["url"] == "https://openrouter.ai/api/v1/videos/gen-vid-fixture"
+
+
+def test_invalid_video_job_id_stops_before_request():
+    c, _ = client({})
+    with pytest.raises(ProviderError, match="video job ID"):
+        video.job_status(c, "not a job ID")
+    assert c.session.calls == []
+
+
+def test_video_redirect_uses_a_separate_session_without_credentials(tmp_path, monkeypatch):
+    import requests
+
+    location = "https://storage.invalid/video.mp4?signature=fixture"
+    c, _ = client({("GET", "/content?index=0"): H.FakeResp(302, headers={"Location": location})})
+    body = b"fixture" * 200
+    storage = MagicMock()
+    download_session = storage.__enter__.return_value
+    response = download_session.get.return_value.__enter__.return_value
+    response.status_code = 200
+    response.iter_content.return_value = iter([body])
+    monkeypatch.setattr(requests, "Session", lambda: storage)
+
+    out = video.download(c, "gen-vid-fixture", tmp_path / "video.mp4")
+    assert out.read_bytes() == body
+    assert c.session.calls[0]["headers"]["Authorization"] == f"Bearer {KEY}"
+    assert c.session.calls[0]["allow_redirects"] is False
+    assert download_session.trust_env is False
+    download_session.get.assert_called_once_with(location, timeout=900, stream=True, allow_redirects=False)
 
 
 def test_free_listing_sends_no_key():
