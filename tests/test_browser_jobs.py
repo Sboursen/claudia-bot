@@ -1,7 +1,4 @@
-"""Every job is Grok's: the production asks with `slop relay job --kind midjourney|suno|browser|grok-imagine`, Grok
-runs it (Grok Imagine on its own tool, Suno through Suno's connector, Midjourney and other sites in its signed-in
-browser; skills grok-imagine, suno, midjourney) and the person only decides. The brief, the profile, the relay skill and
-the stage guides all say so; nothing tells the person to paste, create or download."""
+"""External job records remain local for operator review."""
 from __future__ import annotations
 
 import importlib.util
@@ -24,13 +21,13 @@ def read(p: Path) -> str:
     return p.read_text(encoding="utf-8")
 
 
-def test_the_relay_takes_midjourney_suno_and_browser_jobs_for_grok(tmp_path, monkeypatch):
-    env = RT.setup(tmp_path, monkeypatch)
+def test_the_relay_records_midjourney_suno_and_browser_metadata(tmp_path, monkeypatch):
+    RT.setup(tmp_path, monkeypatch)
     assert K.run("relay", "setup")[0] == 0
     rc, out = K.run("relay", "job", "--kind", "midjourney", "--text", "close-up of a woman --ar 16:9 --v 8.2",
                     "--text", "wide shot of a city --ar 16:9 --v 8.2 --p abc123x", "--name", "plates")
-    assert rc == 0 and "Grok runs it in its own browser" in out["text"], out
-    assert "dropped --v 8.2" in out["text"] and "P button" in out["text"] and "abc123x" not in str(out)
+    assert rc == 0 and not out["dispatch_enabled"], out
+    assert any("dropped --v 8.2" in item for item in out["adjusted"]) and "abc123x" not in str(out)
     rc, out = K.run("relay", "job", "--kind", "suno", "--title", "Hook", "--style", "glassy synth pop",
                     "--instrumental")
     assert rc == 0, out
@@ -45,9 +42,10 @@ def test_the_relay_takes_midjourney_suno_and_browser_jobs_for_grok(tmp_path, mon
     assert jobs["midjourney"]["expect_count"] == 8 and jobs["midjourney"]["save"].endswith("midjourney")
     assert jobs["suno"]["style"] == "glassy synth pop" and jobs["suno"]["instrumental"] is True
     assert jobs["browser"]["url"] == "https://example.com"
-    nxt = r["grok_next"]
-    assert "skill midjourney" in nxt and "skill suno" in nxt and "your browser" in nxt and "the P button on" in nxt
-    assert "to the person" not in nxt, "browser work never goes to the person"
+    assert not r["dispatch_enabled"] and "Automatic job dispatch is disabled" in r["grok_next"]
+    for job in jobs.values():
+        assert K.run("relay", "claim", job["job"])[0] == 1
+        assert K.run("relay", "copy", job["job"])[0] == 1
     rc, out = K.run("relay", "done", jobs["browser"]["job"], "--note", "the title is Example Domain")
     assert rc == 0, out
 
@@ -60,7 +58,7 @@ def test_the_relay_refuses_incomplete_browser_jobs(tmp_path, monkeypatch):
     assert K.run("relay", "job", "--kind", "browser", "--url", "https://example.com")[0] != 0, "a note says what to do"
 
 
-def test_everyone_knows_browser_work_is_groks():
+def test_archived_production_recipe_preserves_prior_browser_guidance():
     brief = read(ROOT / "templates" / "production-brief.md")
     assert "Every job is Grok's" in brief and "--kind midjourney" in brief and "--kind suno" in brief
     assert "Never ask the person to paste, press Create, download" in brief

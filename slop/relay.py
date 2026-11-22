@@ -1,111 +1,47 @@
-"""`slop relay`: Grok passes the person's words; the production (Claude Code, or Codex, on this computer) does the work.
+"""Local relay queue for production messages, replies and job records.
 
-One relay per bot, no project name needed. Grok's side:
-  slop --json relay setup [--engine claude|codex] [--model M]    check the engine; register the claudia.gallery MCP
-                                                                 and the audio tools (earshot, ElevenLabs); install
-                                                                 the Claudia skill; write the production brief
-  slop --json relay send '<words>' [--from grok] | --file F      the person's words, verbatim; starts a production turn
-         [--attach PATH ...]                                     when the production is idle (returns in seconds)
-  slop --json relay read [--wait S] [--all]                      what to show next, open jobs, and one `grok_next` line
-  slop --json relay claim JOB [--stale-ok]                       take a job before running it (one at a time)
-  slop --json relay copy JOB [--k N] [--field F]                 a prompt on the clipboard: paste it, never type it
-  slop --json relay done JOB --file PATH [--file PATH ...]       a job's files are saved: tells the production
-  slop --json relay fail JOB --reason '<words>' [--declined]     a job could not be done: tells the production
-  slop --json relay status | stop | log [--lines N]
-The production's side (it works in the projects folder and picks or creates the project itself):
-  slop relay say TEXT [--show FILE ...]                          a message for the director
-  slop relay ask QUESTION [--default X] [--show FILE ...]        one question, with its default
-  slop relay job --kind grok-imagine|midjourney|suno|browser|person ...   work for Grok: Grok Imagine with its own
-                                                                 tool, Suno through its connector, Midjourney and
-                                                                 any site in its browser; or a step only the person
-                                                                 can do; numbered J-0003
-  slop relay inbox                                               new messages, marked read
+Run `slop relay setup` to create local queue state, then
+`slop relay send -- MESSAGE` to record a message. Review it with
+`slop relay inbox` and inspect replies or jobs through `relay read`
+and `relay status`. Attachments must be staged under the projects directory.
 
-Files, in $SLOP_HOME/relay/ (all LF; appends for the logs, atomic renames for the rest; a short lock folder guards
-every change):
-  config.json        engine, model, what setup did
-  inbox.jsonl        {id, ts, t, from, text}: every message to the production, verbatim
-  decisions.md       every director message, dated, append-only (the production copies decisions into a project's
-                     DECISIONS.md with `slop -p NAME decide`)
-  outbox.jsonl       {id, ts, t, kind say|ask|job, text, default, files[], turn, auto}: every message for the director
-                     and every job (job J-NNNN = outbox id NNNN, with all its fields; absolute paths)
-  jobs.json          {J-NNNN: {status claimed|done|failed|declined|cancelled, files[], reason, ended}}; a job not in
-                     it is open; a claim (Grok runs it now) lapses after 45 min
-  state.json         cursors (delivered = last inbox id given to the production, read = last outbox id Grok showed),
-                     turns, sessions {engine: id}, last_error, last_turn
-  runner.json        the supervisor: starting | running | idle | failed | stopped (+ pid, job id)
-  turn.json          the running turn: number, start, pid, last progress line (written by the supervisor only)
-  relay.log          one line per event; turns/turn-NNNN.jsonl (+ .err): each turn's raw stream and stderr
-  grok-active.json   when Grok last used the relay (a wake-up waits while a run of Grok works)
-  keywatch.json      the supervisor's last OpenRouter key check (twice a day at most) and what it told Grok
-  bin/               a `slop` command for the production (this toolkit's Python)
-The brief (CLAUDE.md and AGENTS.md) goes into the projects folder, the production's working folder.
-
-The supervisor is a `slop job` (`relay _run`): it takes the pending messages, runs one engine turn with them as the
-prompt (resuming the same session), and repeats until nothing is pending; a message that arrives during a turn waits
-for the next one. A failed turn puts its messages back and stops; the next `send` starts again.
+The former production supervisor ran authenticated engines unattended with
+host privileges. The relay queues work without starting a production process
+until it has an isolated execution and approval broker. Existing queue state
+and logs are readable, and `relay stop` can stop a supervisor from an earlier
+installation.
 """
 from __future__ import annotations
 
 import argparse
 import contextlib
-import io
 import json
 import os
 import re
+import stat
 import subprocess
-import sys
-import threading
 import time
 import uuid
 from pathlib import Path
 
 from . import util
-from .config import SlopError, projects_root, resolve_project, slop_home, toolkit_root
+from .config import SlopError, projects_root, resolve_project, slop_home
 
-MCP_NAME = "claudia"
-MCP_URL = "https://claudia.gallery/mcp"
-EARSHOT_MCP, ELEVEN_MCP = "earshot", "elevenlabs"   # the production's audio tools (stdio MCP servers)
-ELEVEN_PKG = "elevenlabs-mcp"                       # the official server; it needs mcp<2, earshot mcp>=2: own env
-# (0.12.2 is its last release: ElevenLabs now points to a hosted server that signs in with OAuth only, no key, which a
-# production with no browser cannot use; the local one still runs on the newest elevenlabs SDK)
-# its tools the production never runs: phone calls, conversational agents, a clone of a real person's voice (a
-# likeness), playback (this computer has no speakers), and changes to the person's account (a designed voice saved to
-# their library, audio uploaded for inpainting)
-ELEVEN_BLOCKED = ("make_outbound_call", "list_phone_numbers", "create_agent", "add_knowledge_base_to_agent",
-                  "simulate_conversation", "voice_clone", "play_audio", "create_voice_from_preview",
-                  "upload_music_for_inpainting")
-SKILL_URL = "https://claudia.gallery/skill/claudia-skill.zip"
 ENGINES = ("claude", "codex")
 DEFAULT_MODEL = {"claude": "opus", "codex": None}
+PRODUCTION_BLOCKED = "autonomous production is disabled until an isolated execution broker is available"
 WAIT_CAP_S = 240.0
 READ_SETTLE = 5                # a production that stops working must stay stopped this many polls (2 s) to end a wait
 CLAIM_TTL_S = 10 * 60         # a Grok run ends ~5 min in: a claim this old belongs to a run that is gone
 JOB_STALE_S = 6 * 3600         # an open job this old is never run without asking the production first
-GROK_ACTIVE_S = 120.0          # Grok touched the relay this recently: a wake-up would start a second, overlapping run
 PROD_STALL_S = 20 * 60         # a working production with no progress line for this long may be stuck
-KEY_WATCH_S = 12 * 3600        # the supervisor checks the OpenRouter key (free) at most this often
-WAKE_KEY_ENV = "CLAUDIA_WAKE_KEY"   # the wake-up routine's webhook key: a masked secure secret card, never a file
-WAKE_QUIET_S = 8.0             # posts in a burst (a say, then an ask) wake Grok once
-WAKE_TICK_S = 2.0
-WAKE_RETRY_S = (30.0, 120.0)   # a failed wake-up is tried again after these, then given up for that batch
-PROMPT_ARG_MAX = 6000          # longer prompts go through a file (Windows command lines max out at 32,767 chars)
 START_GRACE_S = 30.0           # a "starting" claim without a supervisor is given up after this
 LOCK_WAIT_S = 20.0
 LOCK_STALE_S = 60.0            # every change holds the lock for milliseconds; an older lock is a crashed caller's
-BRIEF_MARK = "<!-- slop relay: production brief"
-BRIEF_FILES = {"claude": "CLAUDE.md", "codex": "AGENTS.md"}
-JOB_ENV = ("SLOP_JOB_ID", "SLOP_PROGRESS_FILE", "SLOP_JOB_FILE", "SLOP_FREE_ONLY", "SLOP_PROJECT")
-NO_SESSION_RE = re.compile(r"(?i)no conversation found|session[^.\n]{0,40}not found|thread[^.\n]{0,40}not found|"
-                           r"no rollout found")    # Codex 0.17x: exec resume <gone> says "no rollout found for thread id"
-SIGNIN_RE = re.compile(r"(?i)\b401\b|authenticat|not logged in|please (?:log|sign) ?in|invalid[^.\n]{0,30}token")
-LIMIT_RE = re.compile(r"(?i)usage limit|rate limit|session limit|hit your limit|limit reached")
 EFFORT_DEFAULT = "xhigh"       # both engines; a level the engine or its model does not take falls back to its default
 EFFORT_ENV = {"claude": "SLOP_CLAUDE_EFFORT", "codex": "SLOP_CODEX_EFFORT"}
 EFFORT_USUAL = {"claude": ("low", "medium", "high", "xhigh", "max"),
                 "codex": ("low", "medium", "high", "xhigh", "max", "ultra")}
-EFFORT_RE = re.compile(r"(?i)effort")
-EFFORT_FAST_S = 90.0           # an effort complaint only counts when the turn failed this fast (before any real work)
 
 
 # ================================================================================================== files and lock
@@ -120,9 +56,9 @@ def work_dir() -> Path:
 
 def _dirs() -> tuple[Path, Path]:
     rd, wd = relay_dir(), work_dir()
-    rd.mkdir(parents=True, exist_ok=True)
+    rd.mkdir(parents=True, exist_ok=True, mode=0o700)
     wd.mkdir(parents=True, exist_ok=True)
-    return wd, rd
+    return wd.resolve(), rd
 
 
 def _break_stale(lk: Path) -> bool:
@@ -279,6 +215,11 @@ def _runner(rd: Path) -> dict:
     return r
 
 
+def _require_inactive(rd: Path) -> None:
+    if _runner(rd)["alive"]:
+        raise SlopError("stop the existing production supervisor with `slop relay stop` before changing the local queue")
+
+
 def _pending(rd: Path, st: dict) -> list[dict]:
     seen = int(st.get("delivered") or 0)
     return [m for m in _rows(rd / "inbox.jsonl") if int(m.get("id") or 0) > seen]
@@ -314,21 +255,6 @@ def _jobs(rd: Path, open_only: bool = True) -> list[dict]:
     return out
 
 
-def _grok_touch(rd: Path) -> None:
-    """Grok used the relay just now (a wake-up waits, so two runs of Grok never overlap)."""
-    try:
-        _write_json(rd / "grok-active.json", {"t_m": time.monotonic(), "at": util.iso_now()})
-    except OSError:
-        pass
-
-
-def _grok_busy(rd: Path) -> bool:
-    g = _read_json(rd / "grok-active.json")
-    if time.monotonic() - float(g.get("t_m") or 0) < GROK_ACTIVE_S:
-        return True
-    return any(j["status"] == "claimed" for j in _jobs(rd))
-
-
 def production(rd: Path) -> dict:
     """{state: working|waiting|idle|failed|stopped|queued|not set up, since, turn, last, error, summary}."""
     from .job import dur
@@ -354,7 +280,7 @@ def production(rd: Path) -> dict:
         if quiet > PROD_STALL_S:
             out["stalled"] = True
             out["summary"] += (f". No progress for {dur(quiet)}: it may be stuck. `slop --json relay log` shows the "
-                               "last lines; still stuck: `slop --json relay stop`, then send 'continue'")
+                               "last lines; use `slop --json relay stop` to stop the legacy supervisor.")
         return out
     state = r.get("state")
     if state == "running":                # its process is gone without a record
@@ -366,10 +292,10 @@ def production(rd: Path) -> dict:
         out["summary"] = f"failed: {str(r.get('error') or '?')[:300]}"
         return out
     if state == "stopped":
-        out.update(state="stopped", since=r.get("since"), summary="stopped (the next `relay send` starts it again)")
+        out.update(state="stopped", since=r.get("since"), summary=f"stopped; {PRODUCTION_BLOCKED}")
         return out
     if pend:
-        out.update(state="queued", summary=f"{len(pend)} message(s) wait, but no turn is running")
+        out.update(state="queued", summary=f"{len(pend)} message(s) wait in the local queue; {PRODUCTION_BLOCKED}")
         return out
     talk = [m for m in _rows(rd / "outbox.jsonl") if m.get("kind") in ("say", "ask")]
     last = talk[-1] if talk else None
@@ -378,423 +304,57 @@ def production(rd: Path) -> dict:
         out.update(state="waiting", question=last.get("text"), default=last.get("default"),
                    summary=f"waiting for the director: {str(last.get('text'))[:200]}")
         return out
-    out.update(state="idle", since=r.get("since"), summary="idle (waiting for the person's next words)")
+    out.update(state="idle", since=r.get("since"), summary=f"local queue is idle; {PRODUCTION_BLOCKED}")
     return out
 
 
 # ================================================================================================== setup
-def _mcp_claude() -> dict:
-    from .agents import engines as E
-    add = ["mcp", "add", "--transport", "http", "--scope", "user", MCP_NAME, MCP_URL]
-    cmd = "claude " + " ".join(add)
-    rc, out, err = E.run_cli("claude", ["mcp", "get", MCP_NAME], timeout=60)
-    if rc == 0 and MCP_URL in out + err:
-        return {"ok": True, "already": True, "command": cmd}
-    if rc == 0:                                       # a `claudia` server with another address: replace it
-        E.run_cli("claude", ["mcp", "remove", MCP_NAME, "--scope", "user"], timeout=60)
-    rc, out, err = E.run_cli("claude", add, timeout=60)
-    if rc == 0 or "already exists" in (out + err):
-        return {"ok": True, "already": rc != 0, "command": cmd}
-    return {"ok": False, "command": cmd, "error": (err or out).strip()[-400:] or f"exit {rc}"}
-
-
-def _mcp_codex() -> dict:
-    return _codex_section(MCP_NAME, f'[mcp_servers.{MCP_NAME}]\nurl = "{MCP_URL}"\n', lambda sec: MCP_URL in sec)
-
-
-def _codex_section(name: str, block: str | None, same=None) -> dict:
-    """Codex's config.toml: the [mcp_servers.NAME] section becomes block (None: removed). same(old section) -> True
-    leaves it as it is."""
-    from .agents import engines as E
-    f = E.codex_home() / "config.toml"
-    try:
-        text = f.read_text(encoding="utf-8") if f.is_file() else ""
-    except OSError as e:
-        return {"ok": False, "file": str(f), "error": str(e)}
-    m = re.search(r"(?m)^\[mcp_servers\.\"?%s\"?\]\s*$" % re.escape(name), text)
-    if m:
-        nxt = re.search(r"(?m)^\[", text[m.end():])
-        end = m.end() + nxt.start() if nxt else len(text)
-        if block is not None and (same(text[m.end():end]) if same else text[m.start():end].strip() == block.strip()):
-            return {"ok": True, "already": True, "file": str(f)}
-        text = text[:m.start()] + (block + ("\n" if nxt else "") if block else "") + text[end:]
-    elif block is None:
-        return {"ok": True, "already": True, "file": str(f)}
-    else:
-        text = text.rstrip("\n") + ("\n\n" if text.strip() else "") + block
-    try:
-        util.atomic_write_text(f, text.replace("\r\n", "\n"))
-    except OSError as e:
-        return {"ok": False, "file": str(f), "error": str(e)}
-    return {"ok": True, "already": False, "file": str(f)}
-
-
-def _tool_servers(wd: Path) -> tuple[dict, dict]:
-    """The production's stdio tools that are ready here -> ({name: spec}, {name: why not}). A spec: command, args,
-    env (plain settings) and env_vars (secrets passed by NAME from the production's environment, never written)."""
-    ready, off = {}, {}
-    py = slop_home() / "venv" / "bin" / "python"
-    rc = util.run([str(py), "-I", "-c", "import importlib.util as u, sys; sys.exit(not u.find_spec('earshot'))"],
-                  timeout=60)[0] if py.is_file() else 1
-    if rc == 0:
-        ready[EARSHOT_MCP] = {"command": str(py), "args": ["-m", "earshot", "mcp"], "env_vars": [],
-                              "env": {"EARSHOT_HOME": str(slop_home() / "cache" / "earshot")}}
-    else:
-        off[EARSHOT_MCP] = f"not installed (bash {toolkit_root() / 'bin' / 'setup.sh'} --full adds it)"
-    el = _elevenlabs_server()
-    if el.get("ok"):
-        ready[ELEVEN_MCP] = {"command": el["bin"], "args": [], "env": {"ELEVENLABS_MCP_BASE_PATH": str(wd)},
-                             "env_vars": ["ELEVENLABS_API_KEY"]}
-    else:
-        off[ELEVEN_MCP] = el["why"]
-    return ready, off
-
-
-def _elevenlabs_server() -> dict:
-    """The official ElevenLabs MCP server, newest, in its own environment under $SLOP_HOME/tools (uv). Only with
-    ELEVENLABS_API_KEY set: the server refuses to start without it."""
-    if not util.env_present("ELEVENLABS_API_KEY"):
-        return {"ok": False, "why": "off: no ELEVENLABS_API_KEY (the masked secure secret card)"}
-    home = slop_home()
-    uv, exe = home / "bin" / "uv", home / "bin" / ELEVEN_PKG
-    if not uv.is_file():
-        return {"ok": False, "why": f"uv is missing: bash {toolkit_root() / 'bin' / 'setup.sh'}"}
-    env = {**os.environ, "UV_TOOL_DIR": str(home / "tools"), "UV_TOOL_BIN_DIR": str(home / "bin"),
-           "UV_PYTHON_INSTALL_DIR": str(home / "python"), "UV_CACHE_DIR": str(home / "cache" / "uv")}
-    venv_py = home / "venv" / "bin" / "python"           # the toolkit's own Python: in /workspace, no second download
-    rc, out, err = util.run([str(uv), "tool", "install", "--upgrade", "--python-preference", "only-managed",
-                             *(["--python", str(venv_py)] if venv_py.is_file() else []), ELEVEN_PKG],
-                            timeout=600, env=env)
-    if not exe.is_file():
-        return {"ok": False, "why": f"{ELEVEN_PKG} did not install: {(err or out).strip()[-200:] or f'exit {rc}'}"}
-    return {"ok": True, "bin": str(exe)}
-
-
-def _mcp_claude_stdio(name: str, spec: dict | None) -> dict:
-    """Claude Code (user scope): register a stdio server (spec None: remove it). Its environment reaches the server,
-    so a secret in env_vars is never written into its config."""
-    from .agents import engines as E
-    rc, out, err = E.run_cli("claude", ["mcp", "get", name], timeout=60)
-    if spec is None:
-        if rc == 0:
-            E.run_cli("claude", ["mcp", "remove", name, "--scope", "user"], timeout=60)
-        return {"ok": True, "removed": rc == 0}
-    if rc == 0 and all(v in out + err for v in (spec["command"], *spec["env"].values())):
-        return {"ok": True, "already": True}
-    if rc == 0:
-        E.run_cli("claude", ["mcp", "remove", name, "--scope", "user"], timeout=60)
-    add = ["mcp", "add", "--scope", "user"]
-    for k, v in spec["env"].items():
-        add += ["-e", f"{k}={v}"]
-    add += ["--transport", "stdio", name, "--", spec["command"], *spec["args"]]
-    rc, out, err = E.run_cli("claude", add, timeout=60)
-    if rc == 0:
-        return {"ok": True, "already": False}
-    return {"ok": False, "error": (err or out).strip()[-300:] or f"exit {rc}"}
-
-
-def _mcp_codex_stdio(name: str, spec: dict | None) -> dict:
-    if spec is None:
-        return _codex_section(name, None)
-    q = json.dumps                                   # a TOML basic string, for these plain paths and names
-    block = (f"[mcp_servers.{name}]\ncommand = {q(spec['command'])}\n"
-             + (f"args = [{', '.join(q(x) for x in spec['args'])}]\n" if spec["args"] else "")
-             + (f"env = {{ {', '.join(f'{k} = {q(v)}' for k, v in spec['env'].items())} }}\n" if spec["env"] else "")
-             + (f"env_vars = [{', '.join(q(x) for x in spec['env_vars'])}]\n" if spec["env_vars"] else "")
-             + (f"disabled_tools = [{', '.join(q(x) for x in ELEVEN_BLOCKED)}]\n" if name == ELEVEN_MCP else "")
-             + "startup_timeout_sec = 60\ntool_timeout_sec = 900\n")      # earshot loads its models on the first call
-    return _codex_section(name, block)
-
-
-def _tool_skills(wd: Path) -> list[str]:
-    """earshot's own skill (how to listen, how to read its verdicts) into the projects folder, where both engines look
-    and a computer reset leaves it: .claude/skills (Claude Code) and .agents/skills (Codex)."""
-    import shutil
-    src = slop_home() / "vendor" / "earshot" / "skills" / "earshot"
-    if not (src / "SKILL.md").is_file():
-        return []
-    done = []
-    for d in (".claude", ".agents"):
-        dst = wd / d / "skills" / "earshot"
-        tmp = dst.with_name("earshot.tmp")
-        try:
-            shutil.rmtree(tmp, ignore_errors=True)
-            shutil.copytree(src, tmp)
-            shutil.rmtree(dst, ignore_errors=True)
-            tmp.rename(dst)
-            done.append(str(dst))
-        except OSError:                               # the MCP server works without its skill
-            shutil.rmtree(tmp, ignore_errors=True)
-    return done
-
-
-def _setup_tools(wd: Path, engines: list[str]) -> dict:
-    """earshot and ElevenLabs for each engine the production may run (a tool that is not ready is removed, so a
-    stale entry never fails at start)."""
-    ready, off = _tool_servers(wd)
-    out = {"ready": sorted(ready), "off": off, "skills": _tool_skills(wd) if EARSHOT_MCP in ready else [],
-           "engines": {}}
-    for e in engines:
-        reg = _mcp_claude_stdio if e == "claude" else _mcp_codex_stdio
-        out["engines"][e] = {n: reg(n, ready.get(n)) for n in (EARSHOT_MCP, ELEVEN_MCP)}
-    return out
-
-
-def _install_skill() -> dict:
-    """The official Claudia skill (a zip) into ~/.claude/skills/. Offline: skipped, and said so."""
-    import urllib.request
-    import zipfile
-    from .agents import engines as E
-    url = os.environ.get("SLOP_RELAY_SKILL_URL") or SKILL_URL
-    dest = E.claude_config_dir() / "skills"
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "slop-relay"})
-        with urllib.request.urlopen(req, timeout=30) as r:
-            data = r.read()
-        z = zipfile.ZipFile(io.BytesIO(data))
-    except Exception as e:  # noqa: BLE001 - offline, blocked, or not a zip: the MCP has the same knowledge
-        return {"ok": False, "skipped": True, "url": url,
-                "why": f"could not download it ({type(e).__name__}: {str(e)[:160]}); the claudia MCP has the same "
-                       "knowledge. Later: slop relay setup again"}
-    files = []
-    for info in z.infolist():
-        name = info.filename.replace("\\", "/")
-        if ".." in name.split("/") or name.startswith("/") or re.match(r"^[A-Za-z]:", name):
-            continue                                  # never write outside the skills folder
-        target = dest / name
-        if info.is_dir():
-            target.mkdir(parents=True, exist_ok=True)
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(z.read(info))
-        files.append(name)
-    tops = sorted({n.split("/")[0] for n in files if "/" in n})
-    return {"ok": True, "dir": str(dest), "skills": tops, "files": len(files), "url": url}
-
-
-def _brief_text(eng: str) -> str:
-    tpl = toolkit_root() / "templates" / "production-brief.md"
-    if not tpl.is_file():
-        raise SlopError(f"the brief template is missing ({tpl}): the toolkit checkout is incomplete")
-    subs = {"{{WORK}}": work_dir().as_posix(), "{{TOOLKIT}}": toolkit_root().as_posix(), "{{DATE}}": util.today(),
-            "{{ENGINE}}": eng}
-    text = tpl.read_text(encoding="utf-8").replace("\r\n", "\n")
-    for k, v in subs.items():
-        text = text.replace(k, v)
-    return text
-
-
-def _write_briefs(wd: Path, eng: str, force: bool) -> list[dict]:
-    text = _brief_text(eng)
-    out = []
-    for e, name in BRIEF_FILES.items():
-        f = wd / name
-        try:
-            cur = f.read_text(encoding="utf-8") if f.is_file() else None
-        except OSError:
-            cur = None
-        if cur is not None and BRIEF_MARK not in cur[:400] and not force:
-            out.append({"file": str(f), "engine": e, "written": False,
-                        "why": f"{name} exists and was not written by slop relay (--force replaces it)"})
-            continue
-        util.atomic_write_text(f, text)
-        out.append({"file": str(f), "engine": e, "written": True})
-    return out
-
-
-def _shim(rd: Path) -> Path:
-    """$SLOP_HOME/relay/bin/slop: this toolkit's `slop` for the production (whatever else PATH holds)."""
-    d = rd / "bin"
-    d.mkdir(parents=True, exist_ok=True)
-    if os.name == "nt":
-        util.atomic_write_text(d / "slop.cmd", f'@"{sys.executable}" -m slop %*\n')
-    else:                                 # a Python that is gone (a temporary env) falls back to python3
-        f = d / "slop"
-        util.atomic_write_text(f, f'#!/bin/sh\nPY="{sys.executable}"\n[ -x "$PY" ] || PY=python3\n'
-                                  'exec "$PY" -m slop "$@"\n')
-        f.chmod(0o755)
-    return d
-
-
-def _setup_engine(a_engine: str | None, rd: Path) -> str:
-    """--engine; else the engine the relay already runs; else the one installed and signed in here (Claude Code
-    first); else the person's plans (`onboard set coding-agents`: ChatGPT only means Codex); else Claude Code."""
-    from .agents import engines as E
-    from .agents import status as S
-    if a_engine:
-        return E.norm_engine(a_engine)
-    cur = _read_json(rd / "config.json").get("engine")
-    if cur in ENGINES:
-        return cur
-    for e in ENGINES:
-        try:
-            s = S.engine_status(e)
-        except Exception:  # noqa: BLE001 - an engine that cannot be checked is not the one
-            continue
-        if s.get("installed") and s.get("logged_in"):
-            return e
-    try:
-        from .onboard import state as OS
-        plans = (OS.load().get("settings") or {}).get("coding_agents") or []
-    except Exception:  # noqa: BLE001
-        plans = []
-    return "codex" if "codex" in plans and "claude" not in plans else "claude"
-
-
-def _login_path_hook() -> list[str]:
-    """Codex runs its commands in login shells, and a login shell may reset PATH (Debian's /etc/profile does): load
-    the toolkit's env.sh from ~/.profile and ~/.bashrc too, as the onboarding `path` item does. -> the files changed."""
-    env_sh = slop_home() / "env.sh"
-    if not env_sh.is_file():
-        return []
-    done = []
-    for f in (".profile", ".bashrc"):
-        p = Path.home() / f
-        try:
-            text = p.read_text(encoding="utf-8") if p.is_file() else ""
-            if str(env_sh) in text:
-                continue
-            with open(p, "a", encoding="utf-8", newline="\n") as fh:
-                fh.write(("" if not text or text.endswith("\n") else "\n") + f". {env_sh}\n")
-            done.append(f)
-        except OSError:
-            pass
-    return done
-
-
 def cmd_setup(a) -> dict:
+    """Create local queue metadata without probing or configuring vendor engines."""
     from .agents import engines as E
-    from .agents import status as S
+
     wd, rd = _dirs()
-    eng = _setup_engine(a.engine, rd)
-    if eng not in ENGINES:
-        raise SlopError(f"the relay runs Claude Code (claude) or Codex (codex), not {eng}")
-    title = E.SPEC[eng]["title"]
-    s = S.engine_status(eng)
-    if not s["installed"] or not s["logged_in"]:
-        nxt = f"slop agents install {eng}" if not s["installed"] else (s.get("next") or f"slop agents login {eng}")
-        what = "is not installed" if not s["installed"] else "is not signed in"
-        return {"ok": False, "engine": eng, "error": f"{title} {what}", "next": nxt,
-                "text": f"{title} {what} on this computer, so the relay was not set up.\n  next: {nxt}   (then: "
-                        f"slop --json relay setup --engine {eng})"}
-    mcp = _mcp_claude() if eng == "claude" else _mcp_codex()
-    also = {}                         # the other engine gets the claudia MCP too: either one may produce later
-    for e in ENGINES:
-        if e == eng:
-            continue
-        if e == "codex":
-            also[e] = _mcp_codex()    # a config file: ready the day Codex is installed
-        elif S.engine_status(e)["installed"]:
-            also[e] = _mcp_claude()
-    skill = _install_skill() if (eng == "claude" and not a.no_skill) else {
-        "ok": False, "skipped": True, "why": "--no-skill" if a.no_skill else "Codex reads the MCP and AGENTS.md"}
-    briefs = _write_briefs(wd, eng, a.force)
-    tools = _setup_tools(wd, [eng] + [e for e in also if e == "codex" or also[e].get("ok")])
-    _shim(rd)
-    hooked = _login_path_hook()
-    prev = _read_json(rd / "config.json")
-    model = a.model if a.model is not None else (prev.get("model") if prev.get("engine") == eng and "model" in prev
-                                                 else DEFAULT_MODEL[eng])   # a model the person chose stays
     with _lock(rd):
-        _write_json(rd / "config.json", {"engine": eng, "model": model or None, "set_up": util.iso_now(),
-                                         "work_dir": str(wd), "mcp": mcp, "mcp_also": also, "skill": skill,
-                                         "briefs": briefs, "tools": tools,
-                                         "toolkit": str(toolkit_root())})
-    _log(rd, f"setup: engine {eng} model {model or 'default'}; mcp {'ok' if mcp.get('ok') else 'FAILED'}; skill "
-             f"{'ok' if skill.get('ok') else 'skipped'}")
-    mine = next(b for b in briefs if b["engine"] == eng)
-    ok = bool(mcp.get("ok")) and mine["written"]
-    mcp_line = "  claudia MCP: " + ("already registered" if mcp.get("already") else "registered" if mcp.get("ok")
-                                    else f"FAILED ({mcp.get('error')})") \
-        + (f"  ({mcp['command']})" if mcp.get("command") else f"  ({mcp.get('file')})")
-    lines = [f"relay set up: the production is {title}" + (f" ({model})" if model else "") + f", working in {wd}",
-             f"  signed in: {s.get('auth_text') or 'yes'}" + (f", plan {s['plan']}" if s.get("plan") else ""),
-             mcp_line] + [f"  claudia MCP for {E.SPEC[e]['title']} too: "
-                          + ("ready" if m.get("ok") else f"FAILED ({m.get('error')})") for e, m in also.items()] + [
-             "  Claudia skill: " + (f"installed in {skill['dir']} ({', '.join(skill['skills']) or 'files'})"
-                                    if skill.get("ok") else f"skipped: {skill.get('why')}")]
-    lines += [f"  brief: {b['file']}" + ("" if b["written"] else f" NOT written: {b['why']}") for b in briefs]
-    for n, what in ((EARSHOT_MCP, "earshot (the production's ears)"), (ELEVEN_MCP, "ElevenLabs")):
-        bad = [f"{E.SPEC[e]['title']}: {r[n].get('error')}" for e, r in tools["engines"].items() if not r[n].get("ok")]
-        lines.append(f"  {what}: " + (tools["off"][n] if n in tools["off"] else
-                                      f"FAILED ({'; '.join(bad)})" if bad else
-                                      "ready for " + ", ".join(E.SPEC[e]["title"] for e in tools["engines"])))
-    if hooked:
-        lines.append("  login shells now load env.sh too: " + ", ".join(f"~/{f}" for f in hooked))
-    nxt = "slop --json relay send '<the person's words, verbatim>'"
-    err = None
-    if not mcp.get("ok"):
-        nxt, err = mcp.get("command") or "slop --json relay setup", mcp_line.strip()
-    elif not mine["written"]:
-        nxt, err = f"slop --json relay setup --engine {eng} --force", f"brief not written: {mine['why']}"
-    lines.append(f"next: {nxt}")
-    return {"ok": ok, "engine": eng, "model": model, "work_dir": str(wd), "relay_dir": str(rd), "mcp": mcp,
-            "mcp_also": also, "tools": tools,
-            "skill": skill, "briefs": briefs, "next": nxt, **({"error": err} if err else {}), "text": "\n".join(lines)}
+        _require_inactive(rd)
+        previous = _read_json(rd / "config.json")
+        eng = E.norm_engine(a.engine) if a.engine else previous.get("engine") or "claude"
+        if eng not in ENGINES:
+            raise SlopError("choose Claude Code or Codex as the production engine")
+        if a.model is not None:
+            model = a.model
+        else:
+            model = previous.get("model", DEFAULT_MODEL[eng]) if previous.get("engine") == eng else DEFAULT_MODEL[eng]
+        cfg = {"engine": eng, "model": model or None, "set_up": util.iso_now(),
+               "work_dir": str(wd), "production_enabled": False}
+        _write_json(rd / "config.json", cfg)
+    _log(rd, f"setup: local queue for engine {eng}")
+    return {**cfg, "relay_dir": str(rd), "next": "slop --json relay inbox",
+            "text": f"local relay queue ready; {PRODUCTION_BLOCKED}"}
 
 
 # ================================================================================================== send / inbox
-def _words(a, what: str) -> str:
-    text = " ".join(a.text or [])
-    f = getattr(a, "file", None)
-    if f:
-        if text:
-            raise SlopError(f"give the {what} as TEXT or --file, not both")
-        try:
-            text = Path(f).expanduser().read_text(encoding="utf-8")
-        except OSError as e:
-            raise SlopError(f"cannot read {f}: {e}") from None
-    if not text.strip():
-        raise SlopError(f"nothing to {what}: slop --json relay {what} '<the words>'")
-    return text
-
-
-def _start_runner(wd: Path, rd: Path, claim: str) -> dict:
-    from . import job
-    try:
-        r = job.start(["relay", "_run"], project=None, again=True, cwd=str(wd), status_sig="relay")
-    except SlopError as e:
-        with _lock(rd):
-            if _read_json(rd / "runner.json").get("claim") == claim:
-                _write_json(rd / "runner.json", {"state": "failed", "error": f"could not start the production: {e}",
-                                                 "since": util.iso_now(), "since_ts": time.time()})
-        raise
-    s = r["job"]
-    with _lock(rd):
-        cur = _read_json(rd / "runner.json")
-        if cur.get("claim") == claim:
-            cur["job_id"] = s["id"]
-            _write_json(rd / "runner.json", cur)
-    return s
-
-
 def cmd_send(a) -> dict:
-    wd, rd = _dirs()
-    text = _words(a, "send")
-    files, missing = [], []
-    for f in getattr(a, "attach", None) or []:
-        p = Path(f).expanduser()
-        p = p if p.is_absolute() else Path.cwd() / p
-        (files.append(str(p.resolve())) if p.is_file() else missing.append(f))
-    if missing:
-        raise SlopError(f"--attach: no such file: {', '.join(missing)} (save the person's upload first; nothing was "
-                        "sent)")
+    text = " ".join(a.text or [])
+    if not text.strip():
+        raise SlopError("provide the message after --: slop --json relay send -- MESSAGE")
+
+    files = []
+    for name in a.attach or []:
+        path = _abs_file(name, work_dir().resolve())
+        if path is None:
+            raise SlopError("stage each attachment as a regular file under the projects directory first")
+        files.append(str(path))
     if files:
-        text += "\n" + "\n".join(f"[attached file] {f}" for f in files)
-    if a.sender == "grok":
-        _grok_touch(rd)
-    out = deliver(text, a.sender)
-    out["attached"] = files
-    return out
+        text += "\n" + "\n".join(f"[attached file] {path}" for path in files)
+    return {**deliver(text, a.sender), "attached": files}
 
 
 def deliver(text: str, who: str, job_update: tuple | None = None) -> dict:
-    """Append a message to the inbox (director words also to decisions.md, dated) and start a turn when nothing runs.
-    job_update = (job id, record): written to jobs.json under the same lock."""
-    wd, rd = _dirs()
-    cfg = _cfg(rd)
-    claim = None
+    """Append a local inbox message and an optional job update under one lock."""
+    _, rd = _dirs()
     with _lock(rd):
+        cfg = _cfg(rd)
+        _require_inactive(rd)
         if job_update:
             jobs = _read_json(rd / "jobs.json")
             jobs[job_update[0]] = job_update[1]
@@ -804,29 +364,13 @@ def deliver(text: str, who: str, job_update: tuple | None = None) -> dict:
                                      "from": who, "text": text})
         if who == "director":
             dl = rd / "decisions.md"
-            head = "" if dl.is_file() else ("# The director's words (slop relay; dated, append-only, never edited)\n\n")
+            head = "" if dl.is_file() else "# The director's words (slop relay; dated, append-only, never edited)\n\n"
             util.append_text(dl, head + f"- {util.stamp()} - [director, relay #{mid}] "
                              + re.sub(r"\s*\n\s*", " / ", text.strip()) + "\n")
-        run = _runner(rd)
-        if not run["alive"]:
-            claim = uuid.uuid4().hex[:10]
-            _write_json(rd / "runner.json", {"state": "starting", "claim": claim, "since": util.iso_now(),
-                                             "since_ts": time.time(), "since_mono": time.monotonic()})
-    _log(rd, f"in #{mid} from {who}: {text[:120]}")
-    out = {"ok": True, "id": mid, "from": who, "engine": cfg["engine"], "next": "slop --json relay read --wait 200"}
-    if claim:
-        try:
-            s = _start_runner(wd, rd, claim)
-        except SlopError as e:
-            return {**out, "ok": False, "error": str(e),
-                    "text": f"message #{mid} saved, but the production did not start: {e}"}
-        out.update(started=True, job=s["id"], text=f"message #{mid} passed on; the production started a turn "
-                   f"(job {s['id']}). Next: slop --json relay read --wait 200")
-    else:
-        p = production(rd)
-        out.update(started=False, queued=True, text=f"message #{mid} passed on; the production is busy "
-                   f"({p.get('summary')}): the next turn picks it up. Next: slop --json relay read --wait 200")
-    return out
+    _log(rd, f"in #{mid} from {who}")
+    return {"ok": True, "id": mid, "from": who, "engine": cfg["engine"], "started": False, "queued": True,
+            "production_enabled": False, "next": "slop --json relay inbox",
+            "text": f"message #{mid} saved in the local queue; {PRODUCTION_BLOCKED}"}
 
 
 def cmd_inbox(a) -> dict:
@@ -845,11 +389,75 @@ def cmd_inbox(a) -> dict:
 
 
 # ================================================================================================== say / ask / job
+@contextlib.contextmanager
+def _staged_dir(path: Path, create: bool = False):
+    """Open a directory beneath the configured project root without following links."""
+    root = work_dir().resolve()
+    relative = path.relative_to(root)
+    if ".." in relative.parts:
+        raise ValueError("not a staged path")
+    if (not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY")
+            or os.open not in os.supports_dir_fd or os.stat not in os.supports_follow_symlinks):
+        raise OSError("protected file traversal is unavailable")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(root, flags)
+    try:
+        for part in relative.parts:
+            if create:
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(part, dir_fd=fd)
+            child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        yield fd
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def _staged_parent(path: Path, create: bool = False):
+    if path.name in ("", ".."):
+        raise ValueError("not a staged file")
+    with _staged_dir(path.parent, create) as parent:
+        yield parent, path.name
+
+
+@contextlib.contextmanager
+def _open_staged_file(path: Path):
+    with _staged_parent(path) as (parent, name):
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        with os.fdopen(fd, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise OSError("not a staged regular file")
+            yield stream
+
+
+def _write_staged_file(path: Path, data: bytes) -> None:
+    with _staged_parent(path) as (parent, name):
+        tmp = f".relay-{uuid.uuid4().hex}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
+            os.replace(tmp, name, src_dir_fd=parent, dst_dir_fd=parent)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp, dir_fd=parent)
+
+
 def _abs_file(f: str, *roots: Path) -> Path | None:
     p = Path(f).expanduser()
     cands = [p] if p.is_absolute() else [Path.cwd() / p] + [r / p for r in roots if r]
-    hit = next((c for c in cands if c.is_file()), None)
-    return hit.resolve() if hit else None
+    for candidate in cands:
+        candidate = candidate.absolute()
+        try:
+            with _staged_parent(candidate) as (parent, name):
+                entry = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                if stat.S_ISREG(entry.st_mode):
+                    return candidate
+        except (OSError, ValueError):
+            continue
+    return None
 
 
 def _turn_no() -> int | None:
@@ -888,25 +496,39 @@ def _post(a, kind: str) -> dict:
     with _lock(rd):
         oid = _next_id(rd / "outbox.jsonl")
         _append(rd / "outbox.jsonl", {"id": oid, "seq": _seq(rd), **rec})
-    _log(rd, f"out #{oid} {kind}: {text[:120]}" + (f" (+{len(files)} files)" if files else ""))
+    _log(rd, f"out #{oid} {kind}" + (f" (+{len(files)} files)" if files else ""))
     return {"id": oid, "kind": kind, "files": files,
-            "text": f"posted #{oid} ({kind}{f', {len(files)} file(s)' if files else ''}): Grok shows it to the "
-                    "director verbatim"}
+            "text": f"recorded locally #{oid} ({kind}{f', {len(files)} file(s)' if files else ''})"}
 
 
-def _video_issue(path: Path) -> str | None:
-    """Why a video plays badly on phones (full range yuvj420p, 4:4:4, 10-bit), else None (ffprobe; unknown: None)."""
-    if path.suffix.lower() not in VIDEO_EXT:
+def _video_probe(path: Path, entries: str, output: str) -> str | None:
+    """Probe a staged MP4/MOV descriptor without external media references."""
+    if path.suffix.lower() not in VIDEO_EXT or _real_ext(path) not in (".mov", ".mp4"):
         return None
     import shutil
     exe = shutil.which("ffprobe")
     if not exe:
         return None
     try:
-        r = subprocess.run([exe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=pix_fmt,color_range",
-                            "-of", "json", str(path)], capture_output=True, text=True, timeout=30)
-        st = (json.loads(r.stdout or "{}").get("streams") or [{}])[0]
-    except (OSError, subprocess.SubprocessError, ValueError):
+        with _open_staged_file(path) as stream:
+            fd = stream.fileno()
+            fd_dir = "/proc/self/fd" if Path("/proc/self/fd").is_dir() else "/dev/fd"
+            result = subprocess.run(
+                [exe, "-v", "error", "-protocol_whitelist", "file", "-f", "mov", "-enable_drefs", "0",
+                 "-select_streams", "v:0", "-show_entries", entries, "-of", output, f"{fd_dir}/{fd}"],
+                capture_output=True, text=True, timeout=30, pass_fds=(fd,), env={"LANG": "C"},
+            )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _video_issue(path: Path) -> str | None:
+    """Why a video plays badly on phones (full range yuvj420p, 4:4:4, 10-bit), if known."""
+    try:
+        st = (json.loads(_video_probe(path, "stream=pix_fmt,color_range", "json") or "{}")
+              .get("streams") or [{}])[0]
+    except (ValueError, AttributeError):
         return None
     pix, rng = str(st.get("pix_fmt") or ""), str(st.get("color_range") or "")
     if not pix:
@@ -947,20 +569,25 @@ def _job_path(p: str | Path, base: Path, wd: Path) -> Path:
     return (base / q).absolute()
 
 
-def _read_text(text: str | None, path: str | None, what: str) -> str | None:
+def _read_text(text: str | None, path: str | None, what: str, *roots: Path) -> str | None:
     if path:
         if text:
             raise SlopError(f"give the {what} as text or as a file, not both")
+        staged = _abs_file(path, *roots)
+        if staged is None:
+            raise SlopError(f"stage the {what} file under the projects directory first")
         try:
-            return Path(path).expanduser().read_text(encoding="utf-8").strip()
-        except OSError as e:
-            raise SlopError(f"cannot read {path}: {e}") from None
+            with _open_staged_file(staged) as stream:
+                return stream.read().decode("utf-8").strip()
+        except (OSError, ValueError):
+            raise SlopError(f"cannot read the staged {what} file") from None
     return text
 
 
 def _project_mj(base: Path) -> dict:
     try:
-        mj = json.loads((base / "project.json").read_text(encoding="utf-8")).get("mj")
+        with _open_staged_file(base / "project.json") as stream:
+            mj = json.load(stream).get("mj")
     except (OSError, ValueError, AttributeError):
         return {}
     return mj if isinstance(mj, dict) else {}
@@ -1008,10 +635,9 @@ def _imagine_fields(a, base: Path, wd: Path) -> dict:
 
 
 def cmd_job(a) -> dict:
-    """(the production) ask Grok for work: Grok Imagine with Grok's own tool (grok.com in its browser only for a
-    1080p clip), Suno through its connector (Suno's own MCP; Grok's browser when it is not set up), Midjourney and any
-    other site in Grok's signed-in browser; --kind person only for what only a person can do."""
+    """Record a planned job and its input and output metadata for local review."""
     wd, rd = _dirs()
+    _require_inactive(rd)
     base = _save_base(a, wd)
     rec: dict = {"kind": "job", "job_kind": a.kind, "what": a.what, "note": a.note}
     adjusted: list[str] = []
@@ -1044,7 +670,7 @@ def cmd_job(a) -> dict:
                             + f": Midjourney shortens prompts over {MJ_PROMPT_MAX} characters, so the image would not "
                             "match its prompt. Trim it and send the job again (nothing was posted; --long overrides)")
     elif a.kind == "suno":
-        lyrics = _read_text(a.lyrics, a.lyrics_file, "lyrics")
+        lyrics = _read_text(a.lyrics, a.lyrics_file, "lyrics", base, wd)
         if not (a.style or "").strip():
             raise SlopError("a suno job needs --style '<the Style of Music field>'")
         if not (lyrics or "").strip() and not a.instrumental:
@@ -1058,14 +684,7 @@ def cmd_job(a) -> dict:
     elif a.kind == "grok-imagine":
         if a.what not in ("still", "clip"):
             raise SlopError("--what still|clip: what Grok Imagine should make")
-        prompt = a.prompt
-        if a.prompt_file:
-            if prompt:
-                raise SlopError("give --prompt or --prompt-file, not both")
-            try:
-                prompt = Path(a.prompt_file).expanduser().read_text(encoding="utf-8").strip()
-            except OSError as e:
-                raise SlopError(f"cannot read {a.prompt_file}: {e}") from None
+        prompt = _read_text(a.prompt, a.prompt_file, "prompt", base, wd)
         if not (prompt or "").strip():
             raise SlopError("a grok-imagine job needs its prompt: --prompt TEXT or --prompt-file FILE")
         rec.update(prompt=prompt, aspect=a.aspect, seconds=a.seconds, **_imagine_fields(a, base, wd))
@@ -1077,32 +696,27 @@ def cmd_job(a) -> dict:
     if a.kind != "grok-imagine":
         default_save = base / "inbox" / a.kind
     save = _job_path(a.save, base, wd) if a.save else default_save.absolute()
-    save.mkdir(parents=True, exist_ok=True)
-    for e in rec.get("expect") or []:
-        Path(e).parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with _staged_dir(save, create=True):
+            pass
+        for expected in rec.get("expect") or []:
+            with _staged_parent(Path(expected), create=True) as (parent, name):
+                with contextlib.suppress(FileNotFoundError):
+                    if not stat.S_ISREG(os.stat(name, dir_fd=parent, follow_symlinks=False).st_mode):
+                        raise OSError("expected output is not a regular file")
+    except (OSError, ValueError):
+        raise SlopError("stage job destinations under the projects directory without symbolic links") from None
     with _lock(rd):
+        _require_inactive(rd)
         oid = _next_id(rd / "outbox.jsonl")
         jid = job_id(oid)
         rec.update(id=oid, seq=_seq(rd), job=jid, ts=util.iso_now(), t=round(time.time(), 3), save=str(save),
                    name=a.name or jid, files=[], turn=_turn_no())
         _append(rd / "outbox.jsonl", {k: v for k, v in rec.items() if v is not None})
     _log(rd, f"out #{oid} job {jid} ({a.kind}{' ' + a.what if a.what else ''})")
-    who = {"person": "Grok gives it to the person",
-           "suno": "Grok makes it through the Suno connector (Suno's own MCP; its browser if that is not set up)",
-           "grok-imagine": ("Grok makes it on grok.com in its browser (1080p, on the person's X plan)"
-                            if rec.get("route") == "browser" else
-                            "Grok makes it with its own Grok Imagine tool (no browser"
-                            + (f", {rec['res']}" if rec.get("res") else "") + ")")}.get(
-        a.kind, "Grok runs it in its own browser")
-    extra = ""
-    if a.kind == "midjourney":
-        extra = (f" Personalization: {'on (Grok presses the P button)' if rec['personalize'] else 'off'}."
-                 + (" The prompts follow the person's Midjourney setup: " + "; ".join(adjusted) + "." if adjusted
-                    else ""))
     return {"id": oid, "job": jid, "save": str(save), "adjusted": adjusted,
-            "text": f"posted job {jid} ({a.kind}): {who}; the result comes back as an inbox message "
-                    f"(\"[grok] {jid} done: files ...\").{extra} End the turn now if nothing else can go on "
-                    "meanwhile."}
+            "dispatch_enabled": False,
+            "text": f"job {jid} ({a.kind}) recorded for local review; automatic dispatch is disabled"}
 
 
 def _open_job(rd: Path, jid: str) -> dict:
@@ -1119,20 +733,13 @@ def _open_job(rd: Path, jid: str) -> dict:
 
 def _media_size(path: Path) -> str | None:
     """'1280x704' for a picture or a clip (ffprobe, else Pillow for pictures); None when unknown."""
-    import shutil
-    exe = shutil.which("ffprobe")
-    if exe:
-        try:
-            r = subprocess.run([exe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
-                                "-of", "csv=s=x:p=0", str(path)], capture_output=True, text=True, timeout=30)
-            m = re.match(r"(\d+)x(\d+)", (r.stdout or "").strip())
-            if m and int(m.group(1)) > 0 and int(m.group(2)) > 0:     # a broken file reads as 0x0: unknown
-                return f"{m.group(1)}x{m.group(2)}"
-        except (OSError, subprocess.SubprocessError):
-            pass
+    info = _video_probe(path, "stream=width,height", "csv=s=x:p=0")
+    m = re.fullmatch(r"([1-9]\d*)x([1-9]\d*)", (info or "").strip())
+    if m:
+        return m[0]
     try:
         from PIL import Image
-        with Image.open(path) as im:
+        with _open_staged_file(path) as stream, Image.open(stream) as im:
             return f"{im.width}x{im.height}" if im.width and im.height else None
     except Exception:  # noqa: BLE001 - not a picture, or no Pillow
         return None
@@ -1157,12 +764,20 @@ def _mj_provenance(j: dict, files: list[str], model: str | None) -> None:
         if k is None and len(texts) == 1:
             k = 1
         ok = bool(k) and k <= len(texts)
-        idx = by_dir.setdefault(p.parent, _read_json(p.parent / "midjourney-prompts.json"))
+        if p.parent not in by_dir:
+            try:
+                with _open_staged_file(p.parent / "midjourney-prompts.json") as stream:
+                    existing = json.load(stream)
+            except (OSError, ValueError):
+                existing = {}
+            by_dir[p.parent] = existing if isinstance(existing, dict) else {}
+        idx = by_dir[p.parent]
         idx[p.name] = {"job": j["job"], "k": k if ok else None, "prompt": texts[k - 1] if ok else None,
                        "plate": plates[k - 1] if ok and k <= len(plates) else None,
                        "personalize": j.get("personalize"), "model": model, "saved": util.iso_now()}
     for d, idx in by_dir.items():
-        _write_json(d / "midjourney-prompts.json", idx)
+        _write_staged_file(d / "midjourney-prompts.json",
+                           (json.dumps(idx, indent=1, ensure_ascii=False) + "\n").encode("utf-8"))
     for f in files:                                   # and inside each PNG itself (a copied file keeps its origin)
         e = by_dir.get(Path(f).parent, {}).get(Path(f).name) or {}
         if Path(f).suffix.lower() == ".png" and e.get("prompt"):
@@ -1176,9 +791,9 @@ IMG_MAGIC = ((b"\x89PNG\r\n\x1a\n", ".png"), (b"\xff\xd8\xff", ".jpg"), (b"GIF8"
 
 def _real_ext(path: Path) -> str | None:
     try:
-        with open(path, "rb") as f:
+        with _open_staged_file(path) as f:
             head = f.read(16)
-    except OSError:
+    except (OSError, ValueError):
         return None
     for magic, ext in IMG_MAGIC:
         if head.startswith(magic):
@@ -1206,11 +821,16 @@ def _with_real_ext(path: Path) -> Path:
     if not ext or path.suffix.lower() in fine:
         return path
     dst = path.with_name(path.name + ext) if not path.suffix or len(path.suffix) > 5 else path.with_suffix(ext)
-    n = 2
-    while dst.exists():
-        dst = path.with_name(f"{path.stem}-{n}{ext}")
-        n += 1
-    path.rename(dst)
+    with _staged_parent(path) as (parent, name):
+        n = 2
+        while True:
+            try:
+                os.stat(dst.name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                break
+            dst = path.with_name(f"{path.stem}-{n}{ext}")
+            n += 1
+        os.rename(name, dst.name, src_dir_fd=parent, dst_dir_fd=parent)
     return dst
 
 
@@ -1219,7 +839,8 @@ def _png_add_text(path: Path, fields: dict) -> None:
     import struct
     import zlib
     try:
-        data = path.read_bytes()
+        with _open_staged_file(path) as stream:
+            data = stream.read()
         i = data.rindex(b"IEND") - 4
         if not data.startswith(b"\x89PNG") or i < 8:
             return
@@ -1227,9 +848,7 @@ def _png_add_text(path: Path, fields: dict) -> None:
         for k, v in fields.items():
             body = k.encode("latin-1") + b"\x00" + str(v).encode("latin-1", "replace")
             chunks += struct.pack(">I", len(body)) + b"tEXt" + body + struct.pack(">I", zlib.crc32(b"tEXt" + body))
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_bytes(data[:i] + chunks + data[i:])
-        tmp.replace(path)
+        _write_staged_file(path, data[:i] + chunks + data[i:])
     except (OSError, ValueError):
         pass
 
@@ -1242,7 +861,7 @@ def _area(size: str) -> int:
 def cmd_done(a) -> dict:
     """(Grok) a job's files are saved: mark it done and tell the production (a turn starts when it is idle)."""
     wd, rd = _dirs()
-    _grok_touch(rd)
+    _require_inactive(rd)
     j = _open_job(rd, a.job)
     files, missing = [], []
     for f in a.file or []:
@@ -1296,47 +915,23 @@ def cmd_done(a) -> dict:
 
 
 def cmd_claim(a) -> dict:
-    """(Grok) take a job before running it. One job at a time, and never one another run already took: two
-    runs of Grok (wake-ups) never make the same song or upload the same video twice."""
+    """Prevent a legacy automated worker from receiving an execution claim."""
     _, rd = _dirs()
-    _grok_touch(rd)
     with _lock(rd):
-        j = _open_job(rd, a.job)
-        if j.get("job_kind") == "person":
-            return {"job": j["job"], "status": j["status"], "text": "a person job needs no claim: post its text and "
-                    "note, then save their file to its expect path and `relay done`"}
-        held = _read_json(rd / "jobs.json").get(j["job"]) or {}
-        mine = bool(a.token) and a.token == held.get("token")
-        if j["status"] == "claimed" and not mine:
-            raise SlopError(f"job {j['job']} is already being run (claimed {j.get('claimed_s', 0) // 60} min ago). "
-                            f"Your own claim from before your turn ended: slop --json relay claim {j['job']} --token "
-                            "<the token it gave you>. Otherwise another run of you has it: leave it and end without a "
-                            "message")
-        busy = [x for x in _jobs(rd) if x["status"] == "claimed" and x["job"] != j["job"]]
-        if busy:
-            raise SlopError(f"job {busy[0]['job']} is being run now (one job at a time): leave {j['job']} for "
-                            "later and end without a message")
-        if j.get("stale_h") and not a.stale_ok and not mine:
-            raise SlopError(f"job {j['job']} is {j['stale_h']} h old: the production may have dropped it. Ask first: "
-                            f"slop --json relay send '{j['job']} is still open: still wanted?' --from grok (it says "
-                            f"yes: slop --json relay claim {j['job']} --stale-ok)")
-        token = held.get("token") if mine else uuid.uuid4().hex[:6]
-        jobs = _read_json(rd / "jobs.json")
-        jobs[j["job"]] = {"status": "claimed", "claimed": util.iso_now(), "claimed_ts": time.time(), "token": token}
-        _write_json(rd / "jobs.json", jobs)
-    _log(rd, f"job {j['job']} claimed" + (" again by its holder" if mine else ""))
-    return {"job": j["job"], "status": "claimed", "token": token,
-            "text": f"job {j['job']} is yours (token {token}): run it now, then `slop --json relay done {j['job']} "
-                    f"--file PATH` (or fail). Your turn ends before it is done: after 'continue', `slop --json relay "
-                    f"claim {j['job']} --token {token}` and carry on. The claim lapses after {CLAIM_TTL_S // 60} min."}
+        job = _open_job(rd, a.job)
+        if job.get("job_kind") == "person":
+            return {"job": job["job"], "status": job["status"], "dispatch_enabled": False,
+                    "text": "person job recorded for local review"}
+    raise SlopError("external job dispatch is disabled until an isolated execution broker is available")
 
 
 def cmd_copy(a) -> dict:
-    """(Grok) a job's prompt (or text) on the clipboard, to paste with Ctrl+V: typing it by hand mangles accented words
-    ("diamanté"). No clipboard tool on this computer: the text goes to a file to open in the browser and copy."""
+    """Copy a locally reviewed person job's text for manual use."""
     import shutil
     _, rd = _dirs()
     j = _open_job(rd, a.job)
+    if j.get("job_kind") != "person":
+        raise SlopError("external job dispatch is disabled until an isolated execution broker is available")
     texts = j.get("text") or ([j["prompt"]] if j.get("prompt") else []) or ([j["lyrics"]] if j.get("lyrics") else [])
     field = (a.field or "").strip()
     if field:
@@ -1350,8 +945,10 @@ def cmd_copy(a) -> dict:
     for cmd in (["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"], ["wl-copy"]):
         if shutil.which(cmd[0]):
             try:
-                subprocess.run(cmd, input=text.encode("utf-8"), timeout=10, check=True,
-                               env={**os.environ, "DISPLAY": os.environ.get("DISPLAY") or ":0"})
+                env = {k: os.environ[k] for k in ("HOME", "PATH", "XAUTHORITY", "XDG_RUNTIME_DIR",
+                                                 "WAYLAND_DISPLAY") if k in os.environ}
+                env["DISPLAY"] = os.environ.get("DISPLAY") or ":0"
+                subprocess.run(cmd, input=text.encode("utf-8"), timeout=10, check=True, env=env)
                 return {"job": j["job"], "copied": True, "chars": len(text),
                         "text": f"on the clipboard ({len(text)} characters): click the prompt box and paste (Ctrl+V)"}
             except (OSError, subprocess.SubprocessError):
@@ -1417,7 +1014,6 @@ JOB_FIELDS = ("id", "job", "job_kind", "what", "prompt", "image", "end_image", "
               "expect", "title", "style", "lyrics", "exclude", "instrumental", "url", "personalize", "plates",
               "expect_count",
               "status", "claimed_s", "claim_expired", "stale_h", "ts")
-SKILL_FOR = {"grok-imagine": "grok-imagine", "midjourney": "midjourney", "suno": "suno"}
 
 
 def _job_item(j: dict) -> dict:
@@ -1455,97 +1051,15 @@ IMAGINE_MAX_REFS = 14
 IMAGINE_MAX_IMAGES_B = 35 * 1024 * 1024
 IMAGINE_DEFAULT_RES = "720p"
 RES_SHORT_SIDE = {"480p": 480, "720p": 720, "1080p": 1080}
-LINK_OVER_B = 20 * 1024 * 1024          # bigger files (and every video) reach the person as a Drive link (skill drive)
 DRIVE_MAX_B = 95 * 1024 * 1024          # Drive takes uploads up to 100 MB: a bigger video never reaches the person
 
 
 def _size(f: str) -> int:
     try:
-        return Path(f).stat().st_size
-    except OSError:
+        with _open_staged_file(Path(f)) as stream:
+            return os.fstat(stream.fileno()).st_size
+    except (OSError, ValueError):
         return 0
-
-
-def _by_link(f: str) -> bool:
-    p = Path(f)
-    try:
-        return p.suffix.lower() in VIDEO_EXT or p.stat().st_size > LINK_OVER_B
-    except OSError:
-        return p.suffix.lower() in VIDEO_EXT
-
-
-def _grok_next(items: list, prod: dict, jobs: list) -> str:
-    steps = []
-    if items:
-        n, nf = len(items), sum(len(i.get("files") or []) for i in items)
-        steps.append(("Post this message" if n == 1 else f"Post these {n} messages") + " verbatim"
-                     + ((" with its files" if n == 1 else " with their files") if nf else ""))
-        big = [f for i in items for f in i.get("files") or [] if _by_link(f)]
-        if big:                                 # chat attachments often fail for videos: the person's Drive instead
-            steps[-1] += (" (send " + ", ".join(Path(f).name for f in big) + " as Google Drive links: skill drive)")
-        huge = [Path(f).name for f in big if _size(f) > DRIVE_MAX_B]
-        if huge:                                # posted with --as-is: Drive refuses it, so ask for a smaller copy
-            steps[-1] += (f"; {', '.join(huge)} is over Drive's 100 MB upload limit: never upload it, ask the "
-                          f"production `slop --json relay send '{huge[0]} is too big for Drive: a share copy under "
-                          "95 MB please' --from grok`")
-    running = [j for j in jobs if j.get("status") == "claimed"]
-    offered = False
-    for j in running:
-        steps.append(f"job {j['job']} is being run (claimed {j.get('claimed_s', 0) // 60} min ago): leave it to "
-                     "that run (yours, from before your turn ended: claim it again with its --token and carry on)")
-    for j in jobs:
-        k = j.get("job_kind")
-        if j.get("status") == "claimed":
-            continue
-        if j.get("stale_h"):
-            steps.append(f"job {j['job']} is {j['stale_h']} h old: never run it unasked; ask the production with "
-                         f"`slop --json relay send '{j['job']} is still open: still wanted?' --from grok` (a yes: "
-                         f"`slop --json relay claim {j['job']} --stale-ok`, then run it)")
-            continue
-        if running and (k in SKILL_FOR or k == "browser"):
-            continue                                  # one job at a time: the next after the running one
-        pbutton = f", the P button {'on' if j.get('personalize', True) else 'off'}" if k == "midjourney" else ""
-        if (k in SKILL_FOR or k == "browser") and offered:
-            how = f"skill {SKILL_FOR[k]}" if k in SKILL_FOR else "your browser, as its note says"
-            steps.append(f"after that, claim job {j['job']} the same way and run it with {how}{pbutton}")
-            continue
-        if k in SKILL_FOR or k == "browser":
-            how = (f"skill {SKILL_FOR[k]}" if k in SKILL_FOR else
-                   f"your browser at {j.get('url') or 'the page its note names'}, doing what its note says") + pbutton
-            steps.append(f"claim job {j['job']} (`slop --json relay claim {j['job']}`; refused: end without a "
-                         f"message), then run it with {how} (save into {j.get('save')}, then `slop --json relay done "
-                         f"{j['job']} --file PATH`, or `slop --json relay fail {j['job']} --reason '...'`)")
-            offered = True                            # one job at a time: the rest come after it
-        else:
-            steps.append(f"give job {j['job']} to the person (its copy blocks verbatim; save what they upload"
-                         + (f" to {j['expect'][0]}" if j.get("expect") else f" into {j.get('save')}")
-                         + f", then `slop --json relay done {j['job']} --file PATH`)")
-    read = "`slop --json relay read --wait 200`"
-    send = "`slop --json relay send '<their words>'`"
-    s = prod.get("state")
-    if s == "working":
-        if not steps:
-            steps.append(f"Nothing new yet ({prod.get('summary')}). Post one status line and \"Say continue\"")
-        steps.append(read)
-    elif s == "waiting":
-        steps.append(f"wait for the person's answer and pass it verbatim with {send}")
-    elif s == "failed":
-        err = str(prod.get("error") or "")
-        fix = ("its sign-in was rejected: `slop agents status` shows the fix" if SIGNIN_RE.search(err) else
-               "the plan's usage limit is reached: wait for the reset" if LIMIT_RE.search(err) else
-               "details: `slop --json relay log`")
-        steps.append(f"tell the person in one line that the production stopped ({err[:160]}; {fix}); after the fix, "
-                     "`slop --json relay send 'continue' --from grok` runs the waiting messages again")
-    elif s == "queued":
-        steps.append("run `slop --json relay send 'continue' --from grok` (messages wait, but no turn runs)")
-    elif s == "not set up":
-        steps.append("run `slop --json relay setup` first")
-    else:
-        steps.append(f"wait for the person's next words and pass them verbatim with {send}")
-    out = steps[0][0].upper() + steps[0][1:]
-    for st in steps[1:]:
-        out += ", then " + st
-    return out + "."
 
 
 def _snapshot(rd: Path) -> tuple:
@@ -1560,13 +1074,9 @@ def _snapshot(rd: Path) -> tuple:
 
 def cmd_read(a) -> dict:
     _, rd = _dirs()
-    _grok_touch(rd)
     wait = max(0.0, min(float(a.wait or 0), WAIT_CAP_S))
     t0 = time.monotonic()
     calm = 0
-    if wait > 0:                                      # Grok is waiting: the waker leaves the news to this read
-        _write_json(rd / "reader.json", {"pid": os.getpid(), "until_m": time.monotonic() + wait + 3,
-                                         "since": util.iso_now()})
     while True:
         # the wait holds its full time unless there is something for Grok: a new item, an open job, or a production
         # that stopped working (waiting, idle, failed) and stays stopped - a blip in its state never ends a wait
@@ -1587,28 +1097,19 @@ def cmd_read(a) -> dict:
         if new or _jobs(rd) or wait - (time.monotonic() - t0) <= 0 or production(rd).get("state") != "working":
             break
         calm = 0                                      # a misread, nothing new after all: keep waiting
-    if wait > 0:
-        _write_json(rd / "reader.json", {"pid": os.getpid(), "until_m": 0, "last": util.iso_now()})
     shown = [r for r in (rows if a.all else new) if r.get("kind") in ("say", "ask")]
     items = [_item(r) for r in shown]
     prod = production(rd)
     jobs = [_job_item(j) for j in _jobs(rd)]
-    nxt = _grok_next(items, prod, jobs)
+    nxt = "Review the relay queue locally. Automatic job dispatch is disabled."
     lines = [_render_item(r) for r in shown] or ["(no new messages from the production)"]
     lines += [_render_job(j) for j in jobs]
     lines.append(f"production: {prod.get('summary')}")
     if prod.get("state") == "failed" and prod.get("log_tail"):
         lines.append("  log tail:\n" + "\n".join("    " + ln for ln in prod["log_tail"].splitlines()))
     lines.append(f"grok_next: {nxt}")
-    try:
-        from .update import reminder
-        upd = reminder()                              # once per new release, one network call a day at most
-    except Exception:  # noqa: BLE001 - a reminder never breaks the relay
-        upd = None
-    if upd:
-        lines.append(f"update: {upd['line']} (add this line once at the end of your reply)")
     return {"items": items, "count": len(items), "new": len(new), "jobs": jobs, "production": prod,
-            "waited_s": round(time.monotonic() - t0, 2), "grok_next": nxt, **({"update": upd} if upd else {}),
+            "waited_s": round(time.monotonic() - t0, 2), "grok_next": nxt, "dispatch_enabled": False,
             "text": "\n".join(lines)}
 
 
@@ -1631,20 +1132,15 @@ def cmd_status(a) -> dict:
     eff = effort_for(eng, rd) if eng in ENGINES else (None, "")
     if eng in ENGINES:
         lines.insert(2, f"  effort: {eff[0] or 'the engine default'} ({eff[1]}); `slop relay effort` changes it")
-    wk = _read_json(rd / "wake.json")
-    lines.insert(3, "  wake-ups: " + (f"on ({_mask_url(wk.get('url'))})" + ("" if os.environ.get(WAKE_KEY_ENV) else
-                                                                          f", no ${WAKE_KEY_ENV}")
-                                     if wk.get("url") else "off (Grok hears only while it waits; slop relay wake)"))
+    lines.insert(3, "  wake-ups: disabled")
     return {"production": prod, "engine": eng, "model": cfg.get("model"), "effort": eff[0], "session": sess,
-            "turns": st.get("turns", 0),
+            "turns": st.get("turns", 0), "production_enabled": False, "dispatch_enabled": False,
             "inbox": len(inbox), "outbox": len(outbox), "unread": unread, "jobs": [_job_item(j) for j in jobs],
             "work_dir": str(wd), "relay_dir": str(rd), "text": "\n".join(lines)}
 
 
 def cmd_effort(a) -> dict:
-    """How hard the production thinks, per engine: Claude Code's --effort, Codex's reasoning effort. No level: what
-    each engine uses and the levels it offers; a level: set it for the next turns ('default' = xhigh again, 'auto' =
-    the engine decides)."""
+    """Inspect or save a local engine effort preference."""
     from .agents import engines as E
     wd, rd = _dirs()
     cfg = _cfg(rd, need=False)
@@ -1658,8 +1154,6 @@ def cmd_effort(a) -> dict:
         if lv not in ("default", "auto"):
             if not re.fullmatch(r"[a-z]{2,16}", lv):
                 raise SlopError(f"an effort level is one word ({', '.join(levels)}), or default, or auto")
-            if src == "claude --help" and lv not in levels:
-                raise SlopError(f"Claude Code offers {', '.join(levels)} (from claude --help), not {lv}")
         with _lock(rd):
             data = _read_json(rd / "effort.json")
             if lv == "default":
@@ -1679,7 +1173,7 @@ def cmd_effort(a) -> dict:
         engines[e] = {"effort": cur or "auto", "source": where}
         title = E.SPEC[e]["title"]
         lines.append(f"{title} effort: {cur or 'the engine decides (auto)'} ({where})"
-                     + (" - the relay runs this engine" if e == cfg.get("engine") else ""))
+                     + (" - preferred engine" if e == cfg.get("engine") else ""))
         why = (data.get("rejected_why") or {}).get(e)
         if why:
             lines.append(f"  {(data.get('rejected') or {}).get(e)} was turned down: {why[:160]}")
@@ -1688,8 +1182,7 @@ def cmd_effort(a) -> dict:
     lines.append(f"levels for {E.SPEC[eng]['title']}: {', '.join(levels)} ({src}); higher = better work, slower, more "
                  "of the plan's usage; default = xhigh; auto = the engine decides")
     if changed:
-        lines.insert(0, f"effort for {E.SPEC[eng]['title']} set to {changed}: it applies from the production's next "
-                        "turn")
+        lines.insert(0, f"saved local effort preference for {E.SPEC[eng]['title']}: {changed}")
     return {"engine": eng, "effort": engines[eng]["effort"], "levels": levels, "levels_from": src,
             "default": EFFORT_DEFAULT, "engines": engines, "changed": changed, "text": "\n".join(lines)}
 
@@ -1732,144 +1225,11 @@ def cmd_stop(a) -> dict:
             _write_json(rd / "turn.json", tj)
     _log(rd, "stopped by `relay stop`")
     return {"stopped": True, "job": r.get("job_id"),
-            "text": "the production is stopped. The person's next words (`relay send`) start a new turn."}
-
-
-# ================================================================================================== the supervisor
-def _prompt(wd: Path, cfg: dict, n: int, msgs: list[dict], prev_err: dict | None) -> str:
-    brief = BRIEF_FILES.get(cfg.get("engine"), "CLAUDE.md")
-    read_it = "read it now if this session has not"
-    try:                                              # an update rewrites the brief: a resumed session reads it again
-        import hashlib
-        sha = hashlib.sha1((wd / brief).read_bytes()).hexdigest()
-        mark = relay_dir() / "brief.sha"
-        old = mark.read_text(encoding="utf-8").strip() if mark.is_file() else None
-        if old != sha:
-            if old:
-                read_it = "it changed since you last read it: read it again now"
-            util.atomic_write_text(mark, sha + "\n")
-    except OSError:
-        pass
-    lines = [f"[slop relay] Production turn {n}. You work in {wd.as_posix()} (the projects folder).",
-             f"You are the production; your brief is {brief} in this folder ({read_it}).", ""]
-    if prev_err:
-        lines += [f"Note: turn {prev_err.get('turn')} ended with an error ({str(prev_err.get('error'))[:300]}). It may "
-                  "have done part of the work: check before redoing it.", ""]
-    lines.append("New messages (verbatim, oldest first):")
-    for m in msgs:
-        who = {"director": "the director", "grok": "Grok (the relay)"}.get(m.get("from"), str(m.get("from")))
-        lines += ["", f"--- message #{m['id']} from {who} ({m.get('ts')}) ---", str(m.get("text")),
-                  f"--- end of message #{m['id']} ---"]
-    lines += ["", "The director sees ONLY what you post with `slop relay say \"...\" --show FILE` or `slop relay ask "
-              "\"...\" --default X --show FILE`; your replies here reach no one. Run `slop relay inbox` between steps "
-              "for new messages. End the turn when you wait for the director or for a job."]
-    return "\n".join(lines) + "\n"
-
-
-def _summ(inp) -> str:
-    if not isinstance(inp, dict):
-        return ""
-    v = inp.get("command") or inp.get("file_path") or inp.get("path") or inp.get("pattern") or inp.get("url") \
-        or inp.get("query") or inp.get("description") or inp.get("prompt") or ""
-    return " ".join(str(v).split())[:140]
-
-
-def _parse_claude(ev: dict, ps: dict) -> str | None:
-    t = ev.get("type")
-    if t == "system" and ev.get("subtype") == "init":
-        ps["session"] = ev.get("session_id") or ps.get("session")
-        mcp = {m.get("name"): m.get("status") for m in ev.get("mcp_servers") or [] if isinstance(m, dict)}
-        return f"started ({ev.get('model')}; claudia MCP {mcp.get(MCP_NAME) or 'missing'})"
-    if t == "assistant":
-        line = None
-        for b in (ev.get("message") or {}).get("content") or []:
-            if b.get("type") == "tool_use":
-                line = f"{b.get('name')} {_summ(b.get('input'))}".strip()
-            elif b.get("type") == "text" and str(b.get("text") or "").strip():
-                ps["text"] = str(b["text"])
-                line = line or "wrote: " + " ".join(str(b["text"]).split())[:140]
-        return line
-    if t == "result":
-        ps["final"] = ev.get("subtype") or "success"
-        ps["is_error"] = bool(ev.get("is_error")) or ps["final"] != "success"
-        res = str(ev.get("result") or "")
-        if res.strip():
-            ps["text"] = res
-        if ps["is_error"]:   # an error result may carry no `result`: its reason is in `errors` (a gone session too)
-            errs = "; ".join(str(e) for e in ev.get("errors") or [] if e)
-            ps["error"] = (res or errs)[:600] or ps["final"]
-        return f"turn ended ({ps['final']}{', ERROR' if ps['is_error'] else ''}, {ev.get('num_turns')} steps)"
-    if t == "rate_limit_event" and (ev.get("rate_limit_info") or {}).get("status") == "rejected":
-        return "usage limit reached"
-    return None
-
-
-def _parse_codex(ev: dict, ps: dict) -> str | None:
-    t = ev.get("type")
-    if t == "thread.started":
-        ps["session"] = ev.get("thread_id") or ps.get("session")
-        return "started"
-    if t in ("item.started", "item.completed"):
-        it = ev.get("item") or {}
-        k = it.get("type")
-        if k == "command_execution" and t == "item.started":
-            return "run " + " ".join(str(it.get("command")).split())[:140]
-        if k == "mcp_tool_call" and t == "item.started":
-            return f"mcp {it.get('server')}.{it.get('tool')}"
-        if k == "agent_message" and t == "item.completed":
-            ps["text"] = str(it.get("text") or "")
-            return "wrote: " + " ".join(ps["text"].split())[:140]
-        if k == "file_change" and t == "item.completed":
-            return "files " + ", ".join(f"{c.get('kind')} {c.get('path')}" for c in it.get("changes") or [])[:160]
-    if t == "turn.completed":
-        ps["final"], ps["is_error"] = "success", False
-        return "turn ended"
-    if t in ("turn.failed", "error"):
-        e = ev.get("error") if t == "turn.failed" else ev
-        msg = e.get("message") if isinstance(e, dict) else str(e)
-        ps.update(final="error", is_error=True, error=str(msg)[:600])
-        return f"error: {str(msg)[:160]}"
-    return None
-
-
-def engine_argv(eng: str, base: list[str], prompt_arg: str, prompt: str, model: str | None, session: str | None,
-                wd: Path, effort: str | None = None) -> tuple[list[str], str | None]:
-    """(argv, stdin text) of one production turn."""
-    if eng == "claude":
-        argv = base + ["-p", prompt_arg, "--output-format", "stream-json", "--verbose", "--permission-mode",
-                       "bypassPermissions",
-                       "--disallowedTools", ",".join(f"mcp__{ELEVEN_MCP}__{x}" for x in ELEVEN_BLOCKED)]
-        if model:
-            argv += ["--model", model]
-        if effort:
-            argv += ["--effort", effort]
-        if session:
-            argv += ["--resume", session]
-        return argv, None
-    common = ["--json", "--skip-git-repo-check", "-c", 'forced_login_method="chatgpt"',
-              "-c", 'sandbox_mode="danger-full-access"', "-c", 'approval_policy="never"',
-              "-c", "shell_environment_policy.ignore_default_excludes=true"]   # keep the toolkit's keys for its commands
-    if model:
-        common += ["-m", model]
-    if effort:
-        common += ["-c", f'model_reasoning_effort="{effort}"']
-    if session:                                       # `exec resume` takes no -C: the turn runs in wd anyway
-        return base + ["exec", "resume", *common, session, "-"], prompt
-    return base + ["exec", *common, "-C", str(wd), "-"], prompt
+            "text": "the production is stopped. Use `relay inbox` to inspect pending messages."}
 
 
 def effort_levels(eng: str) -> tuple[list[str], str]:
-    """The effort levels the engine offers -> (levels, where from). Claude Code lists them in its own help, so a new
-    level shows up the day it ships; Codex does not list them: the usual ones (it may take more, e.g. on newer models)."""
-    if eng == "claude":
-        from .agents import engines as E
-        try:
-            rc, out, err = E.run_cli("claude", ["--help"], timeout=30)
-        except Exception:                                   # noqa: BLE001 - no help: the usual levels
-            rc, out = 1, ""
-        m = re.search(r"--effort\b.{0,240}?\(([a-z]+(?:,\s*[a-z]+)+)\)", out or "", re.S)
-        if rc == 0 and m:
-            return [x.strip() for x in m.group(1).split(",")], "claude --help"
+    """Return known effort levels without executing a vendor CLI."""
     return list(EFFORT_USUAL.get(eng, ())), "the usual levels"
 
 
@@ -1889,415 +1249,30 @@ def effort_for(eng: str, rd: Path) -> tuple[str | None, str]:
     return lv, ("slop relay effort" if data.get(eng) else "default")
 
 
-def _engine_run(wd: Path, rd: Path, cfg: dict, n: int, prompt: str, session: str | None, msgs: list[dict],
-                attempt: int = 1, effort: str | None = "") -> dict:
-    from .agents import engines as E
-    eng = cfg["engine"]
-    b = E.find(eng)
-    if not b:
-        return {"ok": False, "error": f"{E.SPEC[eng]['title']} is not installed: slop agents install {eng}",
-                "session": session}
-    tdir = rd / "turns"
-    tdir.mkdir(parents=True, exist_ok=True)
-    stem = f"turn-{n:04d}" + (f"-{attempt}" if attempt > 1 else "")
-    prompt_arg = prompt
-    if len(prompt) > PROMPT_ARG_MAX:
-        pf = tdir / f"{stem}.prompt.md"
-        util.atomic_write_text(pf, prompt)
-        prompt_arg = f"Read the file {pf.as_posix()} and do what it says."
-    if effort == "":                                  # "" = the setting; None = the engine's own default
-        effort = effort_for(eng, rd)[0]
-    argv, stdin_text = engine_argv(eng, b["argv"], prompt_arg, prompt, cfg.get("model"), session, wd, effort)
-    shim = _shim(rd)
-    pp = os.environ.get("PYTHONPATH", "")
-    root = str(toolkit_root())
-    env = E.base_env(eng, plan_only=True, extra={
-        "SLOP_RELAY_TURN": str(n), "PYTHONUNBUFFERED": "1",
-        "PYTHONPATH": root + (os.pathsep + pp if pp and root not in pp.split(os.pathsep) else "")})
-    for k in JOB_ENV:
-        env.pop(k, None)
-    for k in E.TOOLKIT_SECRETS:       # the production is the spender: each paid step asks --yes, its gate and its caps
-        if os.environ.get(k):
-            env[k] = os.environ[k]
-    if eng == "claude":
-        env.setdefault("MCP_TIMEOUT", "60000")     # earshot's server starts a torch process: give it a minute
-    env["PATH"] = str(shim) + os.pathsep + env.get("PATH", "")
-    ps: dict = {"session": session, "final": None, "is_error": False, "error": None, "text": ""}
-    t0 = time.time()
-    tj = {"n": n, "attempt": attempt, "state": "running", "engine": eng, "effort": effort, "started": util.iso_now(),
-          "started_ts": round(t0, 3), "messages": [m["id"] for m in msgs], "session": session, "pid": None,
-          "last": "starting", "last_at": util.iso_now(), "last_ts": time.time()}
-    kw = {"creationflags": 0x08000000} if os.name == "nt" else {}       # CREATE_NO_WINDOW
-    max_s = float(os.environ.get("SLOP_RELAY_TURN_MAX_S") or 4 * 3600)
-    with open(tdir / f"{stem}.err", "ab") as ef, open(tdir / f"{stem}.jsonl", "ab") as rf:
-        try:
-            p = subprocess.Popen(argv, cwd=str(wd), env=env, stdout=subprocess.PIPE, stderr=ef,
-                                 stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL, **kw)
-        except OSError as e:
-            return {"ok": False, "error": f"could not start {eng}: {e}", "session": session}
-        tj["pid"] = p.pid
-        _write_json(rd / "turn.json", tj)
-        _log(rd, f"turn {n}: {eng} started (pid {p.pid}" + (f", resuming {session}" if session else ", new session")
-             + f") with message(s) {', '.join('#' + str(m['id']) for m in msgs)}")
-        if stdin_text is not None:
-            def feed():
-                try:
-                    p.stdin.write(stdin_text.encode("utf-8"))
-                    p.stdin.close()
-                except OSError:
-                    pass
-            threading.Thread(target=feed, daemon=True).start()
-        timer = threading.Timer(max_s, lambda: (ps.update(timeout=True), p.kill()))
-        timer.daemon = True
-        timer.start()
-        last_w = 0.0
-        for raw in p.stdout:
-            raw = raw.replace(b"\r\n", b"\n")
-            rf.write(raw if raw.endswith(b"\n") else raw + b"\n")
-            rf.flush()
-            try:
-                ev = json.loads(raw.decode("utf-8", "replace"))
-            except ValueError:
-                continue
-            if not isinstance(ev, dict):
-                continue
-            line = _parse_claude(ev, ps) if eng == "claude" else _parse_codex(ev, ps)
-            tj["session"] = ps.get("session") or tj.get("session")
-            if line:
-                _log(rd, f"turn {n}: {line}")
-                tj.update(last=line, last_at=util.iso_now(), last_ts=time.time())
-                if time.monotonic() - last_w > 0.5:
-                    _write_json(rd / "turn.json", tj)
-                    last_w = time.monotonic()
-        rc = p.wait()
-        timer.cancel()
-    ok = rc == 0 and ps.get("final") is not None and not ps.get("is_error")
-    err = None
-    if not ok:
-        etail = _tail(tdir / f"{stem}.err", 3).replace("\n", " ")[-300:]
-        err = (f"the turn took longer than {max_s:g} s and was stopped" if ps.get("timeout") else
-               ps.get("error") or (f"{eng} exited with code {rc}" + (f": {etail}" if etail else "")))
-    tj.update(state="done" if ok else "failed", ended=util.iso_now(), elapsed_s=round(time.time() - t0, 1), exit=rc,
-              error=err, session=ps.get("session"))
-    _write_json(rd / "turn.json", tj)
-    return {"ok": ok, "error": err, "session": ps.get("session"), "text": ps.get("text") or "", "exit": rc,
-            "elapsed_s": tj["elapsed_s"], "effort": effort}
-
-
-def _turn(wd: Path, rd: Path, cfg: dict, n: int, msgs: list[dict], prev_err: dict | None,
-          session: str | None) -> dict:
-    prompt = _prompt(wd, cfg, n, msgs, prev_err)
-    res = _engine_run(wd, rd, cfg, n, prompt, session, msgs)
-    if not res["ok"] and session and NO_SESSION_RE.search(str(res.get("error") or "")):
-        _log(rd, f"turn {n}: the saved session {session} is gone; starting a new session")
-        session = None
-        res = _engine_run(wd, rd, cfg, n, prompt, None, msgs, attempt=2)
-    lv = res.get("effort")
-    if (not res["ok"] and lv and float(res.get("elapsed_s") or 0) < EFFORT_FAST_S
-            and EFFORT_RE.search(str(res.get("error") or ""))):
-        eng = cfg["engine"]                             # the engine (or its model) does not take this level
-        _log(rd, f"turn {n}: {eng} did not take effort {lv} ({str(res.get('error'))[:160]}); running at its own "
-                 "default; `slop relay effort` picks another level")
-        with _lock(rd):
-            data = _read_json(rd / "effort.json")
-            data.setdefault("rejected", {})[eng] = lv
-            data.setdefault("rejected_why", {})[eng] = str(res.get("error") or "")[:300]
-            _write_json(rd / "effort.json", data)
-        res = _engine_run(wd, rd, cfg, n, prompt, session, msgs, attempt=3, effort=None)
-    return res
-
-
-def _mask_url(url: str | None) -> str:
-    from urllib.parse import urlsplit
-    u = urlsplit(url or "")
-    return f"{u.scheme}://{u.hostname}/...{(u.path or '')[-4:]}" if u.scheme and u.hostname else ""
-
-
-def _wake_url(text: str) -> str:
-    """The routine's webhook URL from what was pasted ("POST to https://...", quotes, a trailing dot).
-    Only the real address works: one built from the routine's id was turned down (401) on a live bot."""
-    from urllib.parse import urlsplit
-    m = re.search(r"https?://[^\s\"'<>`]+", (text or "").strip())
-    url = m.group(0).rstrip(".,;:)]}") if m else ""
-    u = urlsplit(url)
-    local = u.hostname in ("127.0.0.1", "localhost", "::1")
-    if "automation=" in (text or "") and "/automations/webhook/" not in url:
-        raise SlopError("that is a link to the routine, not its webhook address: paste the routine's POST to address "
-                        "(Webhook URL, in the Grok Bot desktop app)")
-    if not u.hostname or not (u.scheme == "https" or (u.scheme == "http" and local)):
-        raise SlopError("paste the routine's webhook URL (its POST to field, https://...), or say off or test")
-    return url
-
-def _wake_key() -> str:
-    """$CLAUDIA_WAKE_KEY: the routine's key, or its whole Authorization header line (both are offered to copy)."""
-    k = os.environ.get(WAKE_KEY_ENV, "").strip().strip("\"'`")
-    k = re.sub(r"(?i)^authorization\s*:\s*", "", k)
-    return re.sub(r"(?i)^bearer\s+", "", k).strip()
-
-
-def _reader_active(rd: Path) -> bool:
-    r = _read_json(rd / "reader.json")
-    return float(r.get("until_m") or 0) > time.monotonic() and _alive(r.get("pid"))
-
-
-def wake_send(rd: Path, event: str, unread: list[dict] | None = None) -> dict:
-    """POST to the wake-up routine's webhook, so Grok starts a run that reads the relay. The body names the kind of
-    news only, never its words; the key comes from $CLAUDIA_WAKE_KEY and is never printed. -> {ok, status, error}"""
-    import urllib.error
-    import urllib.request
-    cfg = _read_json(rd / "wake.json")
-    if not cfg.get("url"):
-        return {"ok": False, "status": None, "error": "wake-ups are off (slop relay wake URL)"}
-    unread = unread or []
-    body = json.dumps({"source": "claudia-relay", "event": event, "unread": len(unread),
-                       "kinds": sorted({str(r.get("kind")) for r in unread if r.get("kind")}),
-                       "production": production(rd).get("state")}).encode("utf-8")
-    req = urllib.request.Request(cfg["url"], data=body, method="POST",
-                                 headers={"Content-Type": "application/json", "User-Agent": "claudia-relay"})
-    key = _wake_key()
-    if key:
-        req.add_header("Authorization", f"Bearer {key}")
-    status, err = None, None
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            status = resp.status
-    except urllib.error.HTTPError as e:
-        status = e.code
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        err = str(getattr(e, "reason", None) or e)[:200]
-    ok = status is not None and 200 <= status < 300
-    err = None if ok else (err or f"HTTP {status}" + (" (is the key in the secure secret card "
-                                                       f"{WAKE_KEY_ENV}?)" if status in (401, 403) else ""))
-    if err and cfg.get("built"):                      # set by 0.3.2-0.3.5 from the routine's link: it never worked
-        err += ("; the URL was built from the routine's id, which does not work: ask the person for the routine's "
-                "POST to address (Webhook, in the Grok Bot desktop app) and run `slop --json relay wake '<what they "
-                "pasted>'`")
-    cfg = _read_json(rd / "wake.json")
-    cfg["last"] = {"at": util.iso_now(), "event": event, "unread": len(unread), "ok": ok, "status": status,
-                   "error": err}
-    _write_json(rd / "wake.json", cfg)
-    _log(rd, f"wake: {event} ({len(unread)} unread) -> {'ok ' + str(status) if ok else err}")
-    return {"ok": ok, "status": status, "error": err}
-
-
-class _Waker(threading.Thread):
-    """In the supervisor: wakes Grok when the production posted something Grok has not read and Grok is not waiting
-    in `relay read --wait`, once per burst of posts; and when a turn failed. The same for Claude Code and Codex: it
-    watches the relay's outbox, not the engine. Never takes the relay lock (its POST may take seconds)."""
-
-    def __init__(self, rd: Path):
-        super().__init__(daemon=True, name="relay-waker")
-        self.rd, self.halt = rd, threading.Event()
-        self.newest, self.changed = -1, time.monotonic()
-        self.fails, self.retry_at = 0, 0.0
-
-    def run(self) -> None:
-        while not self.halt.wait(WAKE_TICK_S):
-            try:
-                self.tick()
-            except Exception as e:  # noqa: BLE001 - a wake-up never breaks the production
-                _log(self.rd, f"wake: error {e}")
-
-    def finish(self, event: str | None, turn: int | None = None) -> None:
-        self.halt.set()
-        self.join(timeout=WAKE_TICK_S + 12)
-        if event:
-            try:
-                self.tick(final=event, turn=turn)
-            except Exception as e:  # noqa: BLE001
-                _log(self.rd, f"wake: error {e}")
-
-    def tick(self, final: str | None = None, turn: int | None = None) -> None:
-        cfg = _read_json(self.rd / "wake.json")
-        if not cfg.get("url"):
-            return
-        rows = _rows(self.rd / "outbox.jsonl")
-        newest = max((int(r.get("id") or 0) for r in rows), default=0)
-        now = time.monotonic()
-        if newest != self.newest:
-            self.newest, self.changed = newest, now
-        if _reader_active(self.rd) or (final is None and _grok_busy(self.rd)):
-            return                                    # Grok is waiting, or a run of it is still working: no second run
-        read = int(_read_json(self.rd / "state.json").get("read") or 0)
-        unread = [r for r in rows if int(r.get("id") or 0) > read]
-        fresh = bool(unread) and newest > int(cfg.get("woken_id") or 0)
-        failed = final == "failed" and turn is not None and cfg.get("woken_failed") != turn
-        if not (fresh or failed):
-            return
-        if final is None and (now - self.changed < WAKE_QUIET_S or now < self.retry_at):
-            return                                    # it may post more (a say, then an ask), or a retry comes later
-        r = wake_send(self.rd, final or "posted", unread)
-        cfg = _read_json(self.rd / "wake.json")
-        if r["ok"] or final or self.fails >= len(WAKE_RETRY_S):
-            cfg["woken_id"] = max(newest, int(cfg.get("woken_id") or 0))
-            if failed:
-                cfg["woken_failed"] = turn
-            self.fails, self.retry_at = 0, 0.0
-        else:
-            self.retry_at = now + WAKE_RETRY_S[self.fails]
-            self.fails += 1
-        _write_json(self.rd / "wake.json", cfg)
-
-
 def cmd_wake(a) -> dict:
-    """The wake-up routine: Grok's webhook, called when the production posts while Grok is not waiting. No argument:
-    the setting; a URL: turn wake-ups on; off; test (one wake-up now)."""
+    """Inspect or clear an old wake configuration without contacting its destination."""
+    arg = (a.url or "").strip().lower()
+    if arg not in ("", "off"):
+        raise SlopError("relay wake requests require an authenticated broker and are disabled")
     _, rd = _dirs()
-    arg = (a.url or "").strip()
-    head = None
-    if arg.lower() == "off":
+    with _lock(rd):
         cfg = _read_json(rd / "wake.json")
-        cfg.pop("url", None)
-        _write_json(rd / "wake.json", cfg)
-        head = "wake-ups are off: Grok hears from the production only while it waits"
-        _log(rd, "wake: off")
-    elif arg.lower() == "test":
-        r = wake_send(rd, "test")
-        head = ("test wake-up sent: the routine should run once and find nothing new" if r["ok"] else
-                f"test wake-up FAILED: {r['error']}")
-        if not r["ok"] and not _read_json(rd / "wake.json").get("url"):
-            raise SlopError(r["error"])
-    elif arg:
-        url = _wake_url(arg)
-        rows = _rows(rd / "outbox.jsonl")
-        cfg = _read_json(rd / "wake.json")
-        cfg.update(url=url, built=False, set=util.iso_now(),
-                   woken_id=max((int(r.get("id") or 0) for r in rows), default=0))
-        _write_json(rd / "wake.json", cfg)
-        head = f"wake-ups on: {_mask_url(url)}; next: the key in the secure card, then slop --json relay wake test"
-        _log(rd, f"wake: on ({_mask_url(url)})")
-    cfg = _read_json(rd / "wake.json")
-    on, key = bool(cfg.get("url")), bool(_wake_key())
-    last = cfg.get("last") or {}
-    lines = ([head] if head else []) + [
-        "wake-ups: " + (f"on ({_mask_url(cfg.get('url'))})" if on else "off")
-        + (": built from the routine's id, which does not work; paste its POST to address" if on and cfg.get("built")
-           else ""),
-        f"  key: {'set' if key else 'not set'} (the masked secure secret card {WAKE_KEY_ENV})",
-        "  last: " + (f"{last.get('event')} at {last.get('at')}: " + ("ok" if last.get("ok") else str(last.get("error")))
-                      if last else "never")]
-    out = {"on": on, "url": _mask_url(cfg.get("url")), "key": key, "last": last or None, "text": "\n".join(lines)}
-    if arg.lower() == "test":
-        out["ok"] = bool(last.get("ok"))
-        if not out["ok"]:
-            out["error"] = f"the test wake-up failed: {last.get('error')}"
-    return out
-
-
-def _key_watch(rd: Path) -> None:
-    """The OpenRouter key failing now or soon (rejected, expiring within 14 days, its limit or budget nearly spent)
-    reaches Grok as a toolkit message, at most once a day, before the production's next paid call fails on it. The FREE
-    GET /api/v1/key, at most every 12 h; never the key or its label. SLOP_KEY_WATCH=0 turns it off."""
-    if os.environ.get("SLOP_KEY_WATCH", "1") == "0" or not util.env_present("OPENROUTER_API_KEY"):
-        return
-    kw = _read_json(rd / "keywatch.json")
-    if time.time() - float(kw.get("checked_ts") or 0) < KEY_WATCH_S:
-        return
-    info = util.openrouter_key_info(timeout=15)
-    if info.get("status") == 0:
-        return                                        # openrouter.ai unreachable: the next run tries again
-    trouble = util.openrouter_key_trouble(info)
-    kw.update(checked_ts=time.time(), checked=util.iso_now(), trouble=trouble)
-    if trouble and time.time() - float(kw.get("told_ts") or 0) > 86400:
-        with _lock(rd):
-            oid = _next_id(rd / "outbox.jsonl")
-            _append(rd / "outbox.jsonl", {"id": oid, "seq": _seq(rd), "ts": util.iso_now(), "t": round(time.time(), 3),
-                                          "kind": "say", "source": "toolkit", "files": [],
-                                          "text": f"{trouble[0].upper()}{trouble[1:]}: {util.OPENROUTER_REPLACE}."})
-        kw.update(told_ts=time.time(), told=trouble)
-        _log(rd, f"key watch: told Grok: {trouble}")
-    _write_json(rd / "keywatch.json", kw)
-
-
-def _key_watch_quiet(rd: Path) -> None:
-    try:
-        _key_watch(rd)
-    except Exception as e:  # noqa: BLE001 - a key check never breaks the production
-        _log(rd, f"key watch: error {e}")
+        if arg == "off" and cfg.get("url"):
+            cfg.pop("url", None)
+            _write_json(rd / "wake.json", cfg)
+    return {"on": False, "legacy_configured": bool(cfg.get("url")), "text": "external wake requests are disabled"}
 
 
 def cmd_run(a) -> dict:
-    """The supervisor (a `slop job`): turns until nothing is pending."""
-    wd, rd = _dirs()
-    from .job import proc_start
-    me = os.getpid()
-    jid = os.environ.get("SLOP_JOB_ID")
-    with _lock(rd):
-        r = _runner(rd)
-        if r.get("state") == "running" and r["alive"] and int(r.get("pid") or 0) != me:
-            return {"skipped": True, "text": f"another production supervisor is running (pid {r.get('pid')})"}
-        _write_json(rd / "runner.json", {"state": "running", "pid": me, "pid_start": proc_start(me), "job_id": jid,
-                                         "since": util.iso_now(), "since_ts": time.time()})
-        try:
-            (rd / "stop").unlink()
-        except OSError:
-            pass
-    turns = 0
-    waker = _Waker(rd)
-    waker.start()
-    threading.Thread(target=_key_watch_quiet, args=(rd,), daemon=True, name="relay-keywatch").start()
-    while True:
-        with _lock(rd):
-            cfg = _cfg(rd)
-            st = _read_json(rd / "state.json")
-            pend = _pending(rd, st)
-            if not pend:
-                _write_json(rd / "runner.json", {"state": "idle", "since": util.iso_now(), "since_ts": time.time(),
-                                                 "job_id": jid, "turns_run": turns})
-                break
-            n = int(st.get("turns") or 0) + 1
-            st.update(turns=n, delivered=max(int(m["id"]) for m in pend))
-            prev_err = st.pop("last_error", None)
-            session = (st.get("sessions") or {}).get(cfg["engine"])
-            _write_json(rd / "state.json", st)
-        res = _turn(wd, rd, cfg, n, pend, prev_err, session)
-        turns += 1
-        with _lock(rd):
-            st = _read_json(rd / "state.json")
-            if res.get("session"):
-                st.setdefault("sessions", {})[cfg["engine"]] = res["session"]
-            st["last_turn"] = {"n": n, "ok": res["ok"], "error": res.get("error"), "ended": util.iso_now(),
-                               "elapsed_s": res.get("elapsed_s"), "messages": [m["id"] for m in pend]}
-            stopped = (rd / "stop").exists()
-            posted = [r for r in _rows(rd / "outbox.jsonl") if r.get("turn") == n]
-            if res["ok"] and not posted and str(res.get("text") or "").strip():
-                oid = _next_id(rd / "outbox.jsonl")         # it forgot `relay say`: its last words still reach Grok
-                _append(rd / "outbox.jsonl", {"id": oid, "seq": _seq(rd), "ts": util.iso_now(),
-                                              "t": round(time.time(), 3), "kind": "say",
-                                              "text": str(res["text"]).strip()[:4000], "files": [], "turn": n,
-                                              "auto": True})
-            if not res["ok"]:
-                if not stopped:                              # its messages wait for the next turn
-                    st["delivered"] = min(int(m["id"]) for m in pend) - 1
-                    st["last_error"] = {"turn": n, "error": res.get("error"), "messages": [m["id"] for m in pend]}
-                _write_json(rd / "state.json", st)
-                _write_json(rd / "runner.json", {"state": "stopped" if stopped else "failed", "error": res.get("error"),
-                                                 "turn": n, "since": util.iso_now(), "since_ts": time.time(),
-                                                 "job_id": jid})
-                _log(rd, f"turn {n}: {'stopped' if stopped else 'FAILED'}: {res.get('error')}")
-                end = ({"turns": turns, "stopped": True, "text": f"stopped during turn {n}"} if stopped else
-                       {"ok": False, "turns": turns, "error": f"turn {n} failed: {res.get('error')}"})
-            else:
-                _write_json(rd / "state.json", st)
-                end = None
-        if end is not None:                           # outside the lock: a wake-up may take seconds
-            waker.finish(None if end.get("stopped") else "failed", turn=n)
-            return end
-        _log(rd, f"turn {n}: done in {res.get('elapsed_s')} s")
-    _log(rd, f"idle after {turns} turn(s)")
-    waker.finish("finished")
-    return {"turns": turns, "text": f"the production ran {turns} turn(s) and is idle"}
+    """Reject supervisors launched by an older job record."""
+    raise SlopError(PRODUCTION_BLOCKED)
 
 
 # ================================================================================================== register
 def register(sub) -> None:
-    g = sub.add_parser("relay", help="Grok passes the person's words; the production (Claude Code or Codex here) "
-                                     "does all the work: setup, send, read, done, fail, say, ask, job, inbox, status, "
-                                     "stop, log",
-                       description="Grok is a relay: it passes the person's words verbatim (send), shows what the "
-                                   "production posts (read), and runs the jobs it asks for (done / fail). The "
-                                   "production (Claude Code, or Codex) does all the creative and technical work in the "
-                                   "projects folder. One relay per computer; no project name. See docs/96-relay.md.")
+    g = sub.add_parser("relay", help="local queue for messages, replies and job records",
+                       description="Review the queue locally. Autonomous production and external dispatch require an "
+                                   "isolated execution broker.")
     rs = g.add_subparsers(dest="relay_cmd", metavar="ACTION", required=True)
     mine = [g]
 
@@ -2307,34 +1282,28 @@ def register(sub) -> None:
         mine.append(sp)
         return sp
 
-    p = add("setup", help="check the engine is signed in, register the claudia.gallery MCP and the production's "
-                          "audio tools (earshot; ElevenLabs with its key), install the Claudia skill, write the "
-                          "production brief (CLAUDE.md, AGENTS.md in the projects folder)")
-    p.add_argument("--engine", default=None, help="claude | codex (default: the engine the relay runs, else the "
-                                                  "one signed in here, Claude Code first; ChatGPT only: codex)")
-    p.add_argument("--model", default=None, help="the production's model (default: opus for Claude Code; Codex's own)")
-    p.add_argument("--no-skill", action="store_true", help="do not download the Claudia skill")
-    p.add_argument("--force", action="store_true", help="replace a CLAUDE.md / AGENTS.md that slop relay did not write")
+    p = add("setup", help="initialize the local relay queue")
+    p.add_argument("--engine", help="preferred engine metadata (claude or codex)")
+    p.add_argument("--model", help="preferred model metadata")
+    p.add_argument("--no-skill", action="store_true", help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_setup)
 
-    p = add("send", help="pass words to the production verbatim; starts a turn when it is idle (returns in seconds)")
-    p.add_argument("text", nargs="*", help="the words, verbatim (or --file)")
-    p.add_argument("--file", help="read the words from this file")
+    p = add("send", allow_abbrev=False, help="save literal message text locally")
     p.add_argument("--attach", action="append", metavar="PATH",
-                   help="a file the person sent (repeat per file): checked, passed on with its full path")
+                   help="a regular file already staged under the projects directory")
     p.add_argument("--from", dest="sender", choices=["director", "grok"], default="director",
-                   help="director (default: the person's words, also logged, dated) | grok (a relay note)")
+                   help="sender attribution for the local record")
+    p.add_argument("text", nargs="+", metavar="MESSAGE", help="literal text; put -- before the message")
     p.set_defaults(func=cmd_send)
 
-    p = add("read", help="what Grok shows next: new messages with their files, open jobs, the production's state, "
-                         "grok_next")
+    p = add("read", help="read local replies, attachments and job metadata")
     p.add_argument("--wait", type=float, default=0, metavar="S",
                    help=f"wait up to S seconds (cap {WAIT_CAP_S:g}) while the production works; returns on anything "
                         "new")
     p.add_argument("--all", action="store_true", help="show every message, not only the new ones")
     p.set_defaults(func=cmd_read)
 
-    p = add("done", help="(Grok) a job's files are saved: mark it done and tell the production")
+    p = add("done", help="record a locally reviewed job result and staged files")
     p.add_argument("job", help="the job id, e.g. J-0003")
     p.add_argument("--file", action="append", help="a saved file (repeat per file)")
     p.add_argument("--note", help="one line for the production")
@@ -2342,18 +1311,16 @@ def register(sub) -> None:
                                    "with the files")
     p.set_defaults(func=cmd_done)
 
-    p = add("copy", help="(Grok) put a job's prompt on the clipboard to paste (never type a prompt by hand)")
+    p = add("copy", help="copy text from a manual person job")
     p.add_argument("job", help="the job id, e.g. J-0003")
     p.add_argument("--k", type=int, default=1, help="which prompt of the job (Midjourney: 1 = the first --text)")
     p.add_argument("--field", help="another field instead: style, lyrics, title, exclude, prompt")
     p.set_defaults(func=cmd_copy)
 
-    p = add("claim", help="(Grok) take a job before running it: one job at a time, never one another run "
-                          "took")
+    p = add("claim", help="inspect a manual person job; external execution claims are disabled")
     p.add_argument("job", help="the job id, e.g. J-0003")
-    p.add_argument("--stale-ok", action="store_true",
-                   help="run a job older than 6 h (only after the production said yes)")
-    p.add_argument("--token", help="your own claim's token: take your job back after your turn ended mid-job")
+    p.add_argument("--stale-ok", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--token", help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_claim)
 
     p = add("cancel", help="close a job no one needs any more (cancelled, not failed): the production's own, or "
@@ -2382,9 +1349,7 @@ def register(sub) -> None:
     p.add_argument("--as-is", action="store_true", help="post a video even if phones will play it badly")
     p.set_defaults(func=cmd_ask)
 
-    p = add("job", help="(the production) ask Grok for a job: grok-imagine (Grok's own Grok Imagine tool), suno "
-                        "(Suno's connector, else Grok's browser), midjourney | browser (Grok's signed-in browser); "
-                        "--kind person only for what only a person can do")
+    p = add("job", help="record a proposed job for local review")
     p.add_argument("--kind", choices=["grok-imagine", "midjourney", "suno", "browser", "person"], required=True)
     p.add_argument("--what", help="grok-imagine: still | clip (others: a short label, e.g. plates, song)")
     p.add_argument("--prompt", help="grok-imagine: the prompt, verbatim")
@@ -2429,13 +1394,11 @@ def register(sub) -> None:
     p = add("status", help="the production's state, engine, session, message counts and open jobs")
     p.set_defaults(func=cmd_status)
 
-    p = add("wake", help="the wake-up routine: Grok's webhook, called when the production posts while Grok is "
-                         "not waiting (a URL turns it on; off; test); its key: $CLAUDIA_WAKE_KEY")
-    p.add_argument("url", nargs="?", help="the routine's webhook URL (https), off, or test")
+    p = add("wake", help="inspect or clear a previous wake configuration")
+    p.add_argument("url", nargs="?", help="use off to clear an old configuration")
     p.set_defaults(func=cmd_wake)
 
-    p = add("effort", help="how hard the production thinks, per engine (Claude Code --effort, Codex reasoning "
-                           "effort): show the levels, or set one for the next turns")
+    p = add("effort", help="inspect or save a local engine effort preference")
     p.add_argument("level", nargs="?", help="a level the engine offers (shown without one), default (xhigh) or auto "
                                             "(the engine decides)")
     p.add_argument("--engine", help="claude | codex (default: the engine the relay runs)")

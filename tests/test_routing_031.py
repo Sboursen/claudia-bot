@@ -1,7 +1,4 @@
-"""0.3.1: the routing audit's fixes. The production (Claude Code or Codex) gets the toolkit's keys because it is the
-spender; relay setup picks the engine the person has; Midjourney jobs are one prompt each, with the plate it is for;
-Grok's text view of a job has every field; a changed brief is read again; the scorer runs
-without the cmudict package; login shells load env.sh."""
+"""Local relay routing metadata and portable scorer behavior."""
 from __future__ import annotations
 
 import json
@@ -12,36 +9,19 @@ from pathlib import Path
 
 import pytest
 
-from slop import relay
 
 import test_relay as RT  # noqa: E402  (its fake engine and helpers)
 K = RT.K
 ROOT = Path(__file__).resolve().parents[1]
-FAKE_OR = "sk-or-v1-" + "0" * 64
 
 
-@pytest.mark.parametrize("engine", ["claude", "codex"])
-def test_the_production_gets_the_toolkits_keys(tmp_path, monkeypatch, engine):
-    env = RT.setup(tmp_path, monkeypatch, logged=(engine,))
-    monkeypatch.setenv("OPENROUTER_API_KEY", FAKE_OR)
-    assert K.run("relay", "setup", "--engine", engine)[0] == 0
-    K.run("relay", "send", "hello")
-    RT.collect(lambda it, r: any("heard #1" in i["text"] for i in it) and r["production"]["state"] == "idle")
-    call = [c for c in K.calls(env["state"], engine) if c.get("relay")][-1]
-    assert "OPENROUTER_API_KEY" in call["env_present"], "the spender needs the key"
-    for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
-        assert k not in call["env_present"], "the engine itself still runs on the person's plan"
-    if engine == "codex":
-        assert "shell_environment_policy.ignore_default_excludes=true" in call["argv"]
-
-
-def test_setup_picks_the_engine_the_person_has(tmp_path, monkeypatch):
-    RT.setup(tmp_path, monkeypatch, logged=("codex",))
-    K.run("onboard", "set", "coding-agents", "codex")
+def test_setup_records_the_selected_engine_without_probing(tmp_path, monkeypatch):
+    env = RT.setup(tmp_path, monkeypatch, logged=())
+    rc, out = K.run("relay", "setup", "--engine", "codex")
+    assert rc == 0 and out["engine"] == "codex", out
     rc, out = K.run("relay", "setup")
     assert rc == 0 and out["engine"] == "codex", out
-    rc, out = K.run("relay", "setup")                       # a plain re-run keeps it
-    assert rc == 0 and out["engine"] == "codex"
+    assert not K.calls(env["state"])
 
 
 def test_midjourney_jobs_are_one_prompt_each_with_its_plate(tmp_path, monkeypatch):
@@ -61,14 +41,14 @@ def test_midjourney_jobs_are_one_prompt_each_with_its_plate(tmp_path, monkeypatc
     assert "plates: hall-ms, city-ws" in r["text"]
 
 
-def test_grok_sees_every_field_of_a_job(tmp_path, monkeypatch):
+def test_job_fields_are_available_for_local_review(tmp_path, monkeypatch):
     RT.setup(tmp_path, monkeypatch)
     assert K.run("relay", "setup")[0] == 0
     K.run("relay", "job", "--kind", "browser", "--url", "https://example.com/page", "--note", "read the title")
     K.run("relay", "job", "--kind", "suno", "--title", "Hook", "--style", "glassy synth pop", "--exclude", "metal",
           "--lyrics", "[Verse]\nla la")
     rc, r = K.run("relay", "read")
-    assert "your browser at https://example.com/page" in r["grok_next"]
+    assert rc == 0 and not r["dispatch_enabled"]
     for want in ("url: https://example.com/page", "title: Hook", "style: glassy synth pop", "exclude: metal",
                  "lyrics:\n[Verse]\nla la"):
         assert want in r["text"], want
@@ -106,7 +86,7 @@ def test_a_save_path_from_the_projects_folder_is_not_doubled(tmp_path, monkeypat
     assert K.run("relay", "setup")[0] == 0
     proj = env["wd"] / "announce"
     for save, want in (("announce/inbox/hd", proj / "inbox" / "hd"), ("inbox/hd2", proj / "inbox" / "hd2"),
-                       (str(tmp_path / "abs"), tmp_path / "abs")):
+                       (str(proj / "abs"), proj / "abs")):
         rc, out = K.run("-p", "announce", "relay", "job", "--kind", "grok-imagine", "--what", "still", "--prompt",
                         "x", "--save", save)
         assert rc == 0 and Path(out["save"]) == want.absolute(), (save, out["save"])
@@ -114,33 +94,6 @@ def test_a_save_path_from_the_projects_folder_is_not_doubled(tmp_path, monkeypat
                     "announce/song/take.wav")
     rc, r = K.run("relay", "read")
     assert r["jobs"][-1]["expect"] == [str((proj / "song" / "take.wav").absolute())]
-
-
-def test_videos_and_big_files_go_by_drive_link(tmp_path, monkeypatch):
-    env = RT.setup(tmp_path, monkeypatch)
-    clip = tmp_path / "v1-excerpt.mp4"
-    clip.write_bytes(b"\0" * 1000)
-    monkeypatch.setenv("FAKE_RELAY_SHOW", str(clip))
-    assert K.run("relay", "setup")[0] == 0
-    K.run("relay", "send", "the excerpt please")
-    items, r = RT.collect(lambda it, r: any(i.get("files") for i in it))
-    r = K.run("relay", "read", "--all")[1]
-    assert "send v1-excerpt.mp4 as Google Drive links: skill drive" in r["grok_next"], r["grok_next"]
-    assert relay._by_link(str(clip)) and not relay._by_link(str(tmp_path / "sheet.jpg"))
-
-
-def test_a_changed_brief_is_read_again(tmp_path, monkeypatch):
-    monkeypatch.setenv("SLOP_HOME", str(tmp_path / "home"))
-    (tmp_path / "home" / "relay").mkdir(parents=True)
-    wd = tmp_path / "work"
-    wd.mkdir()
-    (wd / "CLAUDE.md").write_text("brief one\n", encoding="utf-8")
-    first = relay._prompt(wd, {"engine": "claude"}, 1, [], None)
-    assert "read it now if this session has not" in first
-    assert "read it now if this session has not" in relay._prompt(wd, {"engine": "claude"}, 2, [], None)
-    (wd / "CLAUDE.md").write_text("brief two\n", encoding="utf-8")
-    assert "it changed since you last read it: read it again now" in relay._prompt(wd, {"engine": "claude"}, 3, [],
-                                                                                    None)
 
 
 def test_the_scorer_runs_without_the_cmudict_package(tmp_path):
@@ -153,15 +106,11 @@ def test_the_scorer_runs_without_the_cmudict_package(tmp_path):
     assert r.returncode == 0 or "no CMU dictionary" in r.stderr
 
 
-def test_login_shells_load_env_sh(tmp_path, monkeypatch):
+def test_relay_setup_leaves_login_shells_alone(tmp_path, monkeypatch):
     env = RT.setup(tmp_path, monkeypatch)
-    env_sh = Path(os.environ["SLOP_HOME"]) / "env.sh"
-    env_sh.write_text("export PATH=/x:$PATH\n", encoding="utf-8")
-    home = Path(os.environ["HOME"])
-    (home / ".bashrc").write_text("# mine", encoding="utf-8")
+    bashrc = env["home"] / ".bashrc"
+    bashrc.write_text("# existing local configuration\n", encoding="utf-8")
     for _ in range(2):
         assert K.run("relay", "setup")[0] == 0
-    for f in (".profile", ".bashrc"):
-        text = (home / f).read_text(encoding="utf-8")
-        assert text.count(f". {env_sh}") == 1, (f, text)
-    assert (home / ".bashrc").read_text(encoding="utf-8").startswith("# mine\n")
+    assert bashrc.read_text(encoding="utf-8") == "# existing local configuration\n"
+    assert not (env["home"] / ".profile").exists()

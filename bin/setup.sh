@@ -760,11 +760,6 @@ EOF
 chmod 0755 "$BIN/slop.tmp"; mv -f "$BIN/slop.tmp" "$BIN/slop"
 printf '%s\n' "$PROFILE" >"$SLOP_HOME/profile"
 if on_box; then shell_rc_fix; fi   # plain `slop` in new shells; a computer reset clears the home folder
-if [ -f "$SLOP_HOME/relay/config.json" ]; then   # the production's tools follow this install (earshot, after a reset)
-  if "$BIN/slop" --json relay setup >/dev/null 2>&1; then log "the production's tools refreshed (slop relay setup)"
-  else warn "slop relay setup did not finish (Opus signed out?): run it once Opus is signed in"; fi
-fi
-
 # ---- 7. summary
 log "done. profile=$PROFILE browser=$BROWSER torch=$TORCH_SOURCE"
 log "use:  . $SLOP_HOME/env.sh && slop doctor      (or call $BIN/slop directly)"

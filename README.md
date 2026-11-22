@@ -11,7 +11,10 @@ are the ones those videos were made with, generalised for any song and any user.
 **claudia.gallery is the #1 source of truth** (her canon, the films' records, the wiki), and wins over any doc here:
 connect its MCP server first (`docs/05-claudia-gallery.md`).
 
-How the Grok Bot works (three parts, one job each):
+In this fork the relay is a local queue. Automatic agent launches, external job claims and wake requests are paused.
+The Grok recipe is archived. See [local relay operation](docs/96-relay.md) for setup and migration.
+
+The archived Grok Bot workflow used three parts:
 
 | Part | Its job |
 |---|---|
@@ -319,25 +322,25 @@ or after the command name; the documented form is `slop --json --project NAME <c
 | `slop agents test ENGINE [--job JOB]` | one tiny "reply OK" run through runner/deleg.mjs (skipped when not signed in) |
 | `slop agents use [ENGINE] [--for director\|review\|images]` | which agent does what: --for director\|review\|images (no args: show) |
 
-### Relay (Grok passes the words; the production does the work)
+### Relay (local queue)
 
 | Command | What it does |
 |---|---|
-| `slop relay setup [--engine ENGINE] [--model MODEL] [--no-skill] [--force]` | check the engine is signed in, register the claudia.gallery MCP and the production's audio tools (earshot; ElevenLabs with its key), install the Claudia skill, write the production brief (CLAUDE.md, AGENTS.md in the projects folder) |
-| `slop relay send [TEXT] [--file FILE] [--attach PATH] [--from director\|grok]` | pass words to the production verbatim; starts a turn when it is idle (returns in seconds) |
-| `slop relay read [--wait S] [--all]` | what Grok shows next: new messages with their files, open jobs, the production's state, grok_next |
-| `slop relay done JOB [--file FILE] [--note NOTE] [--model MODEL]` | (Grok) a job's files are saved: mark it done and tell the production |
-| `slop relay copy JOB [--k K] [--field FIELD]` | (Grok) put a job's prompt on the clipboard to paste (never type a prompt by hand) |
-| `slop relay claim JOB [--stale-ok] [--token TOKEN]` | (Grok) take a job before running it: one job at a time, never one another run took |
+| `slop relay setup [--engine ENGINE] [--model MODEL]` | initialize the local relay queue |
+| `slop relay send [--attach PATH] [--from director\|grok] MESSAGE` | save literal message text locally |
+| `slop relay read [--wait S] [--all]` | read local replies, attachments and job metadata |
+| `slop relay done JOB [--file FILE] [--note NOTE] [--model MODEL]` | record a locally reviewed job result and staged files |
+| `slop relay copy JOB [--k K] [--field FIELD]` | copy text from a manual person job |
+| `slop relay claim JOB` | inspect a manual person job; external execution claims are disabled |
 | `slop relay cancel JOB [--reason REASON]` | close a job no one needs any more (cancelled, not failed): the production's own, or Grok's when the person says so |
 | `slop relay fail JOB --reason REASON [--declined]` | (Grok) a job could not be done: mark it failed (--declined: the service refused it) |
 | `slop relay say TEXT [--show FILE] [--as-is]` | (the production) post a message for the director, with files to show |
 | `slop relay ask TEXT [--default DEFAULT] [--show FILE] [--as-is]` | (the production) ask the director one question, with its default |
-| `slop relay job --kind grok-imagine\|midjourney\|suno\|browser\|person [--what WHAT] [--prompt PROMPT] [--prompt-file PROMPT_FILE] [--image IMAGE] [--end-image END_IMAGE] [--ref REF] [--aspect 1:1\|16:9\|9:16\|4:3\|3:4\|3:2\|2:3] [--seconds SECONDS] [--res 480p\|720p\|1080p] [--save SAVE] [--name NAME] [--note NOTE] [--text TEXT] [--title TITLE] [--style STYLE] [--lyrics LYRICS] [--lyrics-file LYRICS_FILE] [--exclude EXCLUDE] [--instrumental] [--url URL] [--plate PLATE] [--long] [--personalize on\|off] [--expect EXPECT]` | (the production) ask Grok for a job: grok-imagine (Grok's own Grok Imagine tool), suno (Suno's connector, else Grok's browser), midjourney \| browser (Grok's signed-in browser); --kind person only for what only a person can do |
+| `slop relay job --kind grok-imagine\|midjourney\|suno\|browser\|person [--what WHAT] [--prompt PROMPT] [--prompt-file PROMPT_FILE] [--image IMAGE] [--end-image END_IMAGE] [--ref REF] [--aspect 1:1\|16:9\|9:16\|4:3\|3:4\|3:2\|2:3] [--seconds SECONDS] [--res 480p\|720p\|1080p] [--save SAVE] [--name NAME] [--note NOTE] [--text TEXT] [--title TITLE] [--style STYLE] [--lyrics LYRICS] [--lyrics-file LYRICS_FILE] [--exclude EXCLUDE] [--instrumental] [--url URL] [--plate PLATE] [--long] [--personalize on\|off] [--expect EXPECT]` | record a proposed job for local review |
 | `slop relay inbox` | (the production) new messages from the director and Grok, marked read |
 | `slop relay status` | the production's state, engine, session, message counts and open jobs |
-| `slop relay wake [URL]` | the wake-up routine: Grok's webhook, called when the production posts while Grok is not waiting (a URL turns it on; off; test); its key: $CLAUDIA_WAKE_KEY |
-| `slop relay effort [LEVEL] [--engine ENGINE]` | how hard the production thinks, per engine (Claude Code --effort, Codex reasoning effort): show the levels, or set one for the next turns |
+| `slop relay wake [URL]` | inspect or clear a previous wake configuration |
+| `slop relay effort [LEVEL] [--engine ENGINE]` | inspect or save a local engine effort preference |
 | `slop relay stop [--grace GRACE]` | stop the running production turn (waiting messages stay) |
 | `slop relay log [--lines LINES]` | the tail of the relay log (and the last turn's stderr) |
 

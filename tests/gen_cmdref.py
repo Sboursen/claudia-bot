@@ -28,7 +28,7 @@ GROUPS = [("Next step, background jobs and downloads", ["next", "job", "fetch"])
           ("Taste", ["taste"]),
           ("Setup checklist (onboarding)", ["onboard"]),
           ("Coding agents (Claude Code, Codex, Muse Code, Gemini CLI)", ["agents"]),
-          ("Relay (Grok passes the words; the production does the work)", ["relay"]),
+          ("Relay (local queue)", ["relay"]),
           ("Updates (one quiet reminder per release; update in one step)", ["update"]),
           ("Home GPU", ["gpu"])]
 SKIP_OPTS = {"-h", "--help", "--json", "--project", "-p"}

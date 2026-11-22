@@ -67,8 +67,8 @@ def test_an_over_long_midjourney_prompt_is_flagged(tmp_path, monkeypatch):
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="needs ffmpeg")
 def test_a_video_phones_play_badly_is_never_shown(tmp_path, monkeypatch):
-    _ready(tmp_path, monkeypatch)
-    good, bad = tmp_path / "good.mp4", tmp_path / "bad.mp4"
+    projects = _ready(tmp_path, monkeypatch)["wd"]
+    good, bad = projects / "good.mp4", projects / "bad.mp4"
     for f, pix in ((good, "yuv420p"), (bad, "yuvj420p")):
         subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=160x120:rate=12",
                         "-pix_fmt", pix, "-c:v", "libx264", str(f)], check=True)

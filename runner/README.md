@@ -216,6 +216,7 @@ that widens what a job may do is **refused** unless the run command carries the 
 |---|---|---|
 | `allow_api_billing: true` | `--allow-api-billing` | keeps API-key variables: the engine may bill an API key instead of the subscription |
 | `allow_spend: true` | `--allow-spend` | enables Claude's Higgsfield connector (spends credits) |
+| Codex `network: true` | `--allow-network` | enables outbound access in the Codex workspace-write sandbox |
 | `pass_env: ["NAME"]` | `--pass-env NAME` (comma list or repeat) | hands that secret to the engine |
 | `engine: "raw"`/`argv`, `engine_bin`, `env`, `slop_cmd`, `add_dirs`, `codex_config`, `muse_flags`, a `permission_mode` other than default/acceptEdits/plan, `sandbox: "danger-full-access"`, tools beyond the default list, a `cwd` outside the job/project, a `project_dir` that is not a slop project | `--allow-raw` | overrides the runner's safe defaults |
 
@@ -276,8 +277,8 @@ into `outbox/files/`; everything else (reports, results, scratch notes) goes in 
 |---|---|---|
 | `engine` | — | `claude` \| `codex` \| `muse` \| `raw` (`raw` runs `argv` — for tests and odd jobs; needs `--allow-raw`) |
 | `id`, `kind`, `title`, `brief_template`, `vars`, `created`, `project_name` | from `new` | bookkeeping; `kind` tells the bot which acceptance check to run; `project_name` places a job file copied to `<HOME>` |
-| `brief` | from `new` | the filled brief; written to `BRIEF.md` when that file is missing |
-| `prompt_file` | `BRIEF.md` | |
+| `brief` | from `new` | fallback text for a missing prompt file |
+| `prompt_file` | `BRIEF.md` | path inside the job folder. Use a regular file and real directories, including for nested prompts. An existing prompt takes precedence over `brief`. A replacement import that supplies a new brief at the same prompt path archives the previous run's prompt. |
 | `project_dir` | `../..` | relative to the job folder (or absolute); a missing absolute path falls back to `../..` |
 | `cwd` | the project folder | the engine's working directory |
 | `workflow`, `workflow_args` | from the template | a workflow name or path; args (strings may contain the runtime tokens below) |
@@ -287,7 +288,7 @@ into `outbox/files/`; everything else (reports, results, scratch notes) goes in 
 | `allow_spend` | `false` | when false, Claude's `mcp__claude_ai_Higgsfield` connector tools are denied (true needs `--allow-spend`) |
 | `add_dirs` | — | extra folders the engine may use (the job, project and toolkit folders are always added) |
 | `max_turns`, `max_budget_usd` | — | Claude limits (`max_budget_usd` counts list-price usage even on a plan — leave it unset for workflows) |
-| `sandbox`, `network`, `codex_config` | `workspace-write`, `false`, — | Codex sandbox, network access for the sandbox, extra `-c key=value` |
+| `sandbox`, `network`, `codex_config` | `workspace-write`, `false`, — | Codex sandbox, outbound workspace network access (`true` needs `--allow-network`), extra `-c key=value` |
 | `approval_mode`, `muse_flags`, `provider` | `never`, `["--no-foreign-personal-context"]`, — | Muse; Gemini's `approval_mode` is `auto_edit` (default) \| `default` \| `plan` \| `yolo` (`yolo` needs `--allow-raw`) |
 | `output_schema` | — | a JSON-schema file for the final answer (codex, muse) |
 | `timeout_s` | 21600 (6 h) | the job is stopped (state `failed`, error "timeout") after this |
