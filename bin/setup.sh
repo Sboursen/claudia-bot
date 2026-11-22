@@ -19,7 +19,7 @@
 #
 # What it installs (all under $SLOP_HOME):
 #   bin/uv            uv package manager (GitHub release, SHA-256 checked against its published .sha256; fallback:
-#                     the PyPI wheel; last resort: a uv already on PATH)
+#                     a SHA-256 verified PyPI wheel; last resort: a uv already on PATH)
 #   python/           Python 3.13 managed by uv (python-build-standalone), so the venv survives system upgrades
 #   venv/             the claudia virtualenv; this repo installed editable (`--no-deps`)
 #   ms-playwright/    Playwright's chromium (fallback: the system google-chrome via channel="chrome")
@@ -125,33 +125,87 @@ have() { command -v "$1" >/dev/null 2>&1; }
 runs() { "$@" >/dev/null 2>&1; }   # true if the command runs successfully
 with_timeout() { local s="$1"; shift; if have timeout; then timeout "$s" "$@"; else "$@"; fi; }
 
-fetch() {  # fetch URL OUTFILE  (curl, else wget, else python3)
+fetch() {  # Accept output only after a successful HTTPS transfer.
   local url="$1" out="$2"
+  [[ "$url" == https://* ]] && rm -f "$out" || return 1
   if have curl; then
-    curl -fsSL --connect-timeout 15 --max-time 900 --retry 3 --retry-delay 2 -o "$out" "$url"
-  elif have wget; then
-    wget -q -T 30 -t 3 -O "$out" "$url"
+    if curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 900 \
+            --retry 3 --retry-delay 2 -o "$out" "$url" && [ -s "$out" ]; then return 0; fi
   elif have python3; then
-    python3 -c 'import sys,urllib.request; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])' "$url" "$out"
-  else
-    return 1
+    if python3 -I -S - "$url" "$out" <<'PYFETCH'
+import shutil, sys, urllib.parse, urllib.request
+
+class HttpsRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file, code, message, headers, new_url):
+        if urllib.parse.urlsplit(new_url).scheme != "https":
+            raise ValueError("refusing a non-HTTPS redirect")
+        return super().redirect_request(request, file, code, message, headers, new_url)
+
+with urllib.request.build_opener(HttpsRedirect()).open(sys.argv[1], timeout=30) as src:
+    with open(sys.argv[2], "wb") as dst:
+        shutil.copyfileobj(src, dst)
+PYFETCH
+    then [ -s "$out" ] && return 0; fi
+  elif have wget; then
+    # Older hosts without curl or Python may use direct HTTPS only.
+    if wget --no-config --https-only --max-redirect=0 -q -T 30 -t 3 -O "$out" "$url" \
+        && [ -s "$out" ]; then return 0; fi
   fi
+  rm -f "$out"
+  return 1
 }
 
-sha256_of() {  # sha256_of FILE -> lowercase hex on stdout
+sha256_of() {
   if have sha256sum; then sha256sum "$1" | awk '{print $1}'
   elif have shasum; then shasum -a 256 "$1" | awk '{print $1}'
-  elif have python3; then python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$1"
+  elif have python3; then python3 -I -S - "$1" <<'PYHASH'
+import hashlib, sys
+
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as file:
+    for block in iter(lambda: file.read(1 << 20), b""):
+        digest.update(block)
+print(digest.hexdigest())
+PYHASH
   else return 1; fi
 }
 
-checksum_state() {  # checksum_state FILE "TEXT WITH THE EXPECTED HEX" -> prints ok | mismatch | unknown (always rc 0)
-  local want got
-  want="$(printf '%s' "$2" | tr 'A-F' 'a-f' | grep -oE '[0-9a-f]{64}' | head -n1 || true)"
-  got="$(sha256_of "$1" 2>/dev/null || true)"
-  if [ -z "$want" ] || [ -z "$got" ]; then echo unknown
-  elif [ "$want" = "$got" ]; then echo ok
-  else echo mismatch; fi
+checksum_matches() {
+  local got
+  [[ "$2" =~ ^[0-9A-Fa-f]{64}$ ]] || return 1
+  got="$(sha256_of "$1")" || return 1
+  [[ "$got" == "${2,,}" ]]
+}
+
+release_checksum() {  # A single hash, optionally followed by the expected basename.
+  local line
+  line="$(cat "$1")" || return 1
+  line="${line%$'\r'}"
+  [[ "$line" != *$'\n'* ]] || return 1
+  [[ "$line" =~ ^([0-9A-Fa-f]{64})([[:blank:]]+\*?([^[:blank:]]+))?$ ]] || return 1
+  [[ -z "${BASH_REMATCH[3]:-}" || "${BASH_REMATCH[3]}" == "$2" ]] || return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+extract_bootstrap_member() {  # Copy a single regular member to a caller-owned path.
+  local archive="$1" member="$2" out="$3" listing
+  if ! listing="$(LC_ALL=C TAR_OPTIONS= tar -tvzf "$archive" -- "$member" 2>/dev/null)"; then
+    member="./$member"
+    listing="$(LC_ALL=C TAR_OPTIONS= tar -tvzf "$archive" -- "$member" 2>/dev/null)" || return 1
+  fi
+  [[ "$listing" == -* && "$listing" != *$'\n'* && "$listing" != *" link to "* && "$listing" != *" -> "* ]] || return 1
+  if TAR_OPTIONS= tar -xOzf "$archive" -- "$member" >"$out" && [ -s "$out" ]; then return 0; fi
+  rm -f "$out"
+  return 1
+}
+
+install_bootstrap_binary() {
+  local stage
+  [ -f "$1" ] && [ -s "$1" ] && [ ! -d "$2" ] || return 1
+  stage="$(mktemp "$BIN/.setup-bin.XXXXXXXX")" || return 1
+  if install -m 0755 "$1" "$stage" && mv -f "$stage" "$2"; then return 0; fi
+  rm -f "$stage"
+  return 1
 }
 
 cmu_ok() { [ -f "$CMU_FILE" ] && [ "$(wc -c <"$CMU_FILE" 2>/dev/null || echo 0)" -ge "$CMU_MIN_BYTES" ]; }
@@ -270,66 +324,80 @@ crlf_files() {  # the repo scripts that must have LF endings but contain CR (rel
 
 # =========================================================================== cloudflared (step 5, and --cloudflared)
 CF_NEED="cloudflared is REQUIRED for OpenRouter sung clips (the song window goes to OpenRouter as an HTTPS URL through the quick tunnel), for Higgsfield media_import_url of plates and windows, and for the phone tap app"
-install_cloudflared() {  # install $BIN/cloudflared when it is missing or broken; returns 0 when it runs afterwards
+install_cloudflared() {  # Install a verified release or reuse an existing local binary.
   if [ -x "$BIN/cloudflared" ] && runs "$BIN/cloudflared" --version; then
     log "cloudflared present: $("$BIN/cloudflared" --version 2>&1 | head -n1)"
     return 0
   fi
-  local tmp cf_api cf_tag cf_digest cf_state cf_meta cf_url jpy sys_cf
-  mkdir -p "$BIN"
-  tmp="$(mktemp -d)"
-  # the release tag + the asset's SHA-256 digest from the GitHub API, so the binary can be verified
+  local tmp cf_api cf_tag cf_digest cf_meta cf_url candidate jpy sys_cf
+  local version="${SLOP_CLOUDFLARED_VERSION:-}"
+  mkdir -p "$BIN" || return 1
+  tmp="$(mktemp -d)" || return 1
   cf_api="https://api.github.com/repos/cloudflare/cloudflared/releases/latest"
-  if [ -n "${SLOP_CLOUDFLARED_VERSION:-}" ]; then
-    cf_api="https://api.github.com/repos/cloudflare/cloudflared/releases/tags/$SLOP_CLOUDFLARED_VERSION"
+  if [ -n "$version" ]; then
+    if [[ ! "$version" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]; then
+      warn "invalid cloudflared release tag"
+      rm -rf "$tmp"
+      return 1
+    fi
+    cf_api="https://api.github.com/repos/cloudflare/cloudflared/releases/tags/$version"
   fi
-  cf_tag="${SLOP_CLOUDFLARED_VERSION:-}"; cf_digest=""; cf_state=""; cf_meta=""
-  jpy=python3; [ -x "$PY" ] && jpy="$PY"   # --cloudflared runs before (or without) the venv
-  if fetch "$cf_api" "$tmp/rel.json" 2>/dev/null; then
-    cf_meta="$("$jpy" -c 'import json, sys
-d = json.load(open(sys.argv[1], encoding="utf-8"))
-a = next((x for x in d.get("assets", []) if x.get("name") == sys.argv[2]), {})
-print(d.get("tag_name") or "-", (a.get("digest") or "").replace("sha256:", "") or "-")' "$tmp/rel.json" "$CF_ASSET" 2>/dev/null || true)"
-    case "$cf_meta" in
-      *" "*)
-        if [ "${cf_meta%% *}" != "-" ]; then cf_tag="${cf_meta%% *}"; fi
-        if [ "${cf_meta##* }" != "-" ]; then cf_digest="${cf_meta##* }"; fi ;;
-    esac
-  fi
-  if [ -n "$cf_tag" ]; then
+  jpy=python3
+  if ! have "$jpy" && [ -x "$PY" ]; then jpy="$PY"; fi
+  if fetch "$cf_api" "$tmp/rel.json" && cf_meta="$("$jpy" -I -S - "$tmp/rel.json" "$CF_ASSET" "$version" <<'PYCF'
+import json, re, sys
+
+with open(sys.argv[1], encoding="utf-8") as file:
+    release = json.load(file)
+tag = release.get("tag_name")
+if not isinstance(tag, str) or not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._+-]*", tag):
+    sys.exit("invalid cloudflared release tag")
+if sys.argv[3] and tag != sys.argv[3]:
+    sys.exit("cloudflared release tag does not match the requested version")
+assets = [asset for asset in release.get("assets", []) if asset.get("name") == sys.argv[2]]
+digest = assets[0].get("digest") if len(assets) == 1 else None
+if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9A-Fa-f]{64}", digest):
+    sys.exit("missing or invalid cloudflared release digest")
+print(tag, digest[7:])
+PYCF
+  )"; then
+    read -r cf_tag cf_digest <<< "$cf_meta"
     cf_url="https://github.com/cloudflare/cloudflared/releases/download/$cf_tag/$CF_ASSET"
+    log "downloading cloudflared: $cf_url"
+    if fetch "$cf_url" "$tmp/cf" && checksum_matches "$tmp/cf" "$cf_digest"; then
+      log "cloudflared SHA-256 matches the release digest"
+      candidate="$tmp/cf"
+      case "$CF_ASSET" in
+        *.tgz)
+          candidate="$tmp/cloudflared"
+          if ! extract_bootstrap_member "$tmp/cf" cloudflared "$candidate"; then
+            warn "cloudflared archive did not contain one regular executable member"
+            candidate=""
+          fi
+          ;;
+      esac
+      if [ -n "$candidate" ] && ! install_bootstrap_binary "$candidate" "$BIN/cloudflared"; then
+        warn "could not install the verified cloudflared executable"
+      fi
+    else
+      warn "cloudflared download failed or did not match its SHA-256 digest"
+    fi
   else
-    cf_url="https://github.com/cloudflare/cloudflared/releases/latest/download/$CF_ASSET"
-  fi
-  log "downloading cloudflared: $cf_url"
-  if fetch "$cf_url" "$tmp/cf"; then
-    cf_state="$(checksum_state "$tmp/cf" "$cf_digest")"
-    case "$cf_state" in
-      ok) log "cloudflared SHA-256 matches the release digest" ;;
-      mismatch) warn "the cloudflared download does not match the release's SHA-256 digest: not installing it (re-run later)"; rm -f "$tmp/cf" ;;
-      *) warn "could not verify cloudflared (GitHub API unreachable or no digest); installing it unverified" ;;
-    esac
-  fi
-  if [ -f "$tmp/cf" ]; then
-    rm -f "$BIN/cloudflared"
-    case "$CF_ASSET" in
-      *.tgz) tar -xzf "$tmp/cf" -C "$tmp" && install -m 0755 "$tmp/cloudflared" "$BIN/cloudflared" ;;
-      *) install -m 0755 "$tmp/cf" "$BIN/cloudflared" ;;
-    esac
-    if runs "$BIN/cloudflared" --version; then log "cloudflared installed: $("$BIN/cloudflared" --version 2>&1 | head -n1)"
-    else warn "cloudflared downloaded but does not run"; fi
-  elif [ "$cf_state" != mismatch ]; then
-    warn "cloudflared download failed (github.com blocked?)"
+    warn "could not obtain valid release integrity metadata for cloudflared; skipping the download"
   fi
   rm -rf "$tmp"
   if ! { [ -x "$BIN/cloudflared" ] && runs "$BIN/cloudflared" --version; }; then
-    sys_cf="$(command -v cloudflared 2>/dev/null || true)"   # last resort: one already on PATH (lost on a computer update)
+    sys_cf="$(command -v cloudflared 2>/dev/null || true)"
     if [ -n "$sys_cf" ] && [ "$sys_cf" != "$BIN/cloudflared" ] && runs "$sys_cf" --version; then
-      rm -f "$BIN/cloudflared"; ln -s "$sys_cf" "$BIN/cloudflared"
-      log "using the cloudflared already on PATH: $sys_cf (linked into $BIN; re-run setup after a computer update)"
+      rm -f "$BIN/cloudflared" && ln -s "$sys_cf" "$BIN/cloudflared" || return 1
+      log "using the existing local cloudflared on PATH: $sys_cf"
     fi
   fi
-  [ -x "$BIN/cloudflared" ] && runs "$BIN/cloudflared" --version
+  if [ -x "$BIN/cloudflared" ] && runs "$BIN/cloudflared" --version; then
+    log "cloudflared ready: $("$BIN/cloudflared" --version 2>&1 | head -n1)"
+    return 0
+  fi
+  return 1
 }
 
 if [ "$CF_ONLY" = 1 ] && [ "$CHECK" = 0 ]; then   # bash bin/setup.sh --cloudflared: only this piece
@@ -431,58 +499,116 @@ esac
 
 # ---- 1. uv
 install_uv() {
-  local tmp; tmp="$(mktemp -d)"
-  local url
-  if [ -n "${SLOP_UV_VERSION:-}" ]; then
-    url="https://github.com/astral-sh/uv/releases/download/$SLOP_UV_VERSION/uv-$UV_TRIPLE.tar.gz"
+  local tmp url digest uv_asset="uv-$UV_TRIPLE.tar.gz" version="${SLOP_UV_VERSION:-}"
+  tmp="$(mktemp -d)" || return 1
+  if [ -n "$version" ]; then
+    if [[ ! "$version" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]; then
+      warn "invalid uv release tag"
+      rm -rf "$tmp"
+      return 1
+    fi
+    url="https://github.com/astral-sh/uv/releases/download/$version/$uv_asset"
   else
-    url="https://github.com/astral-sh/uv/releases/latest/download/uv-$UV_TRIPLE.tar.gz"
+    url="https://github.com/astral-sh/uv/releases/latest/download/$uv_asset"
   fi
   log "downloading uv: $url"
-  if fetch "$url" "$tmp/uv.tgz"; then
-    local sumtxt="" state
-    if fetch "$url.sha256" "$tmp/uv.sha256" 2>/dev/null; then sumtxt="$(cat "$tmp/uv.sha256")"; fi
-    state="$(checksum_state "$tmp/uv.tgz" "$sumtxt")"
-    case "$state" in
-      ok) log "uv SHA-256 matches $url.sha256" ;;
-      mismatch) rm -rf "$tmp"; die "the uv download does not match its published SHA-256 ($url.sha256); not installing it. Re-run later." ;;
-      *) warn "could not verify the uv download (no $url.sha256 or no sha256 tool); installing it unverified" ;;
-    esac
+  if fetch "$url.sha256" "$tmp/uv.sha256" && digest="$(release_checksum "$tmp/uv.sha256" "$uv_asset")" \
+      && fetch "$url" "$tmp/uv.tgz" && checksum_matches "$tmp/uv.tgz" "$digest"; then
+    log "uv SHA-256 matches $url.sha256"
+    if extract_bootstrap_member "$tmp/uv.tgz" "uv-$UV_TRIPLE/uv" "$tmp/uv" \
+        && install_bootstrap_binary "$tmp/uv" "$UV"; then
+      if extract_bootstrap_member "$tmp/uv.tgz" "uv-$UV_TRIPLE/uvx" "$tmp/uvx"; then
+        install_bootstrap_binary "$tmp/uvx" "$BIN/uvx" || warn "could not install the optional uvx executable"
+      fi
+      rm -rf "$tmp"
+      return 0
+    fi
   fi
-  if [ -f "$tmp/uv.tgz" ] && tar -xzf "$tmp/uv.tgz" -C "$tmp" && [ -f "$tmp/uv-$UV_TRIPLE/uv" ]; then
-    install -m 0755 "$tmp/uv-$UV_TRIPLE/uv" "$UV"
-    [ -f "$tmp/uv-$UV_TRIPLE/uvx" ] && install -m 0755 "$tmp/uv-$UV_TRIPLE/uvx" "$BIN/uvx"
-    rm -rf "$tmp"; return 0
-  fi
-  warn "GitHub download of uv failed; trying the PyPI wheel"
-  if have python3 && python3 - "$UV" "$UV_TRIPLE" "${SLOP_UV_VERSION:-}" <<'EOF'
-import io, json, os, sys, urllib.request, zipfile
-dest, triple, ver = sys.argv[1], sys.argv[2], sys.argv[3]
-meta = json.load(urllib.request.urlopen(f"https://pypi.org/pypi/uv/{ver + '/' if ver else ''}json", timeout=30))
+  warn "could not verify or extract GitHub uv; trying a checksum-verified PyPI wheel"
+  if have python3 && python3 -I -S - "$tmp" "$UV_TRIPLE" "$version" <<'PYUV'
+import hashlib, json, pathlib, re, shutil, stat, sys, urllib.parse, urllib.request, zipfile
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+tmp, triple, version = sys.argv[1:]
+root = pathlib.Path(tmp)
+opener = urllib.request.build_opener(NoRedirect())
+metadata_url = "https://pypi.org/pypi/uv/" + (version + "/" if version else "") + "json"
+with opener.open(metadata_url, timeout=30) as response:
+    raw = response.read((4 << 20) + 1)
+    if len(raw) > 4 << 20:
+        sys.exit("uv PyPI metadata is too large")
+    meta = json.loads(raw)
+if meta["info"]["name"] != "uv" or (version and meta["info"]["version"] != version):
+    sys.exit("unexpected uv project or version in PyPI metadata")
 arch = "x86_64" if triple.startswith("x86_64") else ("aarch64" if "linux" in triple else "arm64")
-plat = "manylinux" if "linux" in triple else "macosx"
-files = [f for f in meta["urls"] if f["filename"].endswith(".whl") and plat in f["filename"] and arch in f["filename"]]
+platform = "manylinux" if "linux" in triple else "macosx"
+files = [file for file in meta["urls"] if file["filename"].startswith("uv-")
+         and file["filename"].endswith(".whl") and platform in file["filename"] and arch in file["filename"]]
 if not files:
     sys.exit("no matching uv wheel")
-data = urllib.request.urlopen(files[0]["url"], timeout=300).read()
-z = zipfile.ZipFile(io.BytesIO(data))
-name = next(n for n in z.namelist() if n.endswith("/scripts/uv"))
-with open(dest, "wb") as f:
-    f.write(z.read(name))
-os.chmod(dest, 0o755)
-EOF
-  then rm -rf "$tmp"; return 0; fi
+wheel = files[0]
+expected = wheel.get("digests", {}).get("sha256")
+size = wheel.get("size")
+if (not isinstance(expected, str) or not re.fullmatch(r"[0-9A-Fa-f]{64}", expected)
+        or type(size) is not int or not 0 < size <= 100 << 20):
+    sys.exit("missing or invalid uv wheel integrity metadata")
+url = urllib.parse.urlsplit(wheel["url"])
+if (url.scheme != "https" or url.netloc != "files.pythonhosted.org" or url.query or url.fragment
+        or urllib.parse.unquote(url.path.rsplit("/", 1)[-1]) != wheel["filename"]):
+    sys.exit("unexpected uv wheel download origin or filename")
+
+archive = root / "uv.whl"
+digest = hashlib.sha256()
+received = 0
+with opener.open(url.geturl(), timeout=60) as response, archive.open("xb") as output:
+    for block in iter(lambda: response.read(1 << 20), b""):
+        received += len(block)
+        if received > size:
+            sys.exit("uv wheel exceeds its declared size")
+        digest.update(block)
+        output.write(block)
+if received != size or digest.hexdigest() != expected.lower():
+    sys.exit("uv wheel did not match its PyPI size and SHA-256")
+
+with zipfile.ZipFile(archive) as verified:
+    candidates = [info for info in verified.infolist() if info.filename.endswith("/scripts/uv")]
+    if len(candidates) != 1:
+        sys.exit("expected one uv executable in the verified wheel")
+    entry = candidates[0]
+    kind = stat.S_IFMT(entry.external_attr >> 16)
+    if (not re.fullmatch(r"uv-[0-9A-Za-z._+-]+\.data/scripts/uv", entry.filename)
+            or entry.is_dir() or kind not in (0, stat.S_IFREG) or not 0 < entry.file_size <= 200 << 20):
+        sys.exit("invalid uv executable entry")
+    with verified.open(entry) as source, (root / "uv-pypi").open("xb") as output:
+        shutil.copyfileobj(source, output)
+PYUV
+  then
+    if install_bootstrap_binary "$tmp/uv-pypi" "$UV"; then
+      log "installed uv from a SHA-256 verified PyPI wheel"
+      rm -rf "$tmp"
+      return 0
+    fi
+  fi
   rm -rf "$tmp"
   if have uv; then
-    warn "PyPI fallback failed too; copying the uv already on PATH ($(command -v uv))"
-    install -m 0755 "$(command -v uv)" "$UV"; return 0
+    warn "no verified download available; using the existing local uv on PATH ($(command -v uv))"
+    local local_uv
+    local_uv="$(command -v uv)"
+    if [ "$local_uv" != "$UV" ]; then
+      # Follow the existing PATH entry as before. It is a local prerequisite, not a downloaded fallback.
+      install_bootstrap_binary "$local_uv" "$UV" && return 0
+    fi
   fi
   return 1
 }
+
 if [ -x "$UV" ] && runs "$UV" --version; then
   log "uv present: $("$UV" --version)"
 else
-  install_uv || die "cannot get uv: github.com and pypi.org unreachable. Allow github.com (or pypi.org) and re-run."
+  install_uv || die "no verified uv download or usable local uv executable was available"
   log "uv installed: $("$UV" --version)"
 fi
 
