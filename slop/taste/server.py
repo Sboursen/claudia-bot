@@ -33,12 +33,14 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from ..config import SlopError, toolkit_root
-from .store import fonts_dir, images_dir, read_json, taste_dir, write_json
+from .pool import image_bytes
+from .store import read_json, taste_dir, write_json
 
 STATIC = Path(__file__).resolve().parent / "static"
 STATIC_FILES = {"feed.html", "fonts.html", "feed.js", "fonts.js", "app.css"}
 BODY_MAX = 16 * 1024
 POSTS_PER_MIN = 240
+ASSET_POLICY = 1
 CSP = ("default-src 'self'; img-src 'self' data:; font-src 'self'; style-src 'self' 'unsafe-inline'; "
        "script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 
@@ -99,16 +101,17 @@ def make_handler(app: App):
                 b = p.read_bytes()
             except OSError:
                 return self._json({"error": "not found"}, 404)
-            ctype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
-            if p.suffix.lower() in (".ttf", ".otf"):
-                ctype = "font/ttf" if p.suffix.lower() == ".ttf" else "font/otf"
-            elif p.suffix.lower() == ".woff2":
-                ctype = "font/woff2"
-            elif p.suffix.lower() == ".js":
+            self._asset(b, p.suffix.lower(), cache)
+
+        def _asset(self, b: bytes, suffix: str, cache: str) -> None:
+            ctype = mimetypes.guess_type("asset" + suffix)[0] or "application/octet-stream"
+            if suffix in (".ttf", ".otf", ".woff", ".woff2"):
+                ctype = "font/" + suffix[1:]
+            elif suffix == ".js":
                 ctype = "text/javascript; charset=utf-8"
-            elif p.suffix.lower() == ".css":
+            elif suffix == ".css":
                 ctype = "text/css; charset=utf-8"
-            elif p.suffix.lower() == ".html":
+            elif suffix == ".html":
                 ctype = "text/html; charset=utf-8"
             self._bytes(b, ctype, cache)
 
@@ -175,14 +178,21 @@ def make_handler(app: App):
                 it = app.feed.pool.get(iid)
                 if not it:
                     return self._json({"error": "unknown image"}, 404)
-                return self._file(images_dir(app.pdir) / f"{it['id']}.jpg")
+                try:
+                    data = image_bytes(app.pdir, it)
+                except (OSError, ValueError):
+                    return self._json({"error": "unknown image"}, 404)
+                return self._asset(data, ".jpg", "max-age=604800")
             if r == "frame.jpg":
-                return self._file(fonts_dir(app.pdir) / "frame.jpg", "no-store")
+                data = app.fonts.frame_bytes()
+                if data is None:
+                    return self._json({"error": "no staged frame"}, 404)
+                return self._asset(data, ".jpg", "no-store")
             if r.startswith("font/"):
-                p = app.fonts.font_path(r[5:])
-                if not p:
+                asset = app.fonts.font_bytes(r[5:])
+                if asset is None:
                     return self._json({"error": "unknown font"}, 404)
-                return self._file(p, "max-age=2592000")
+                return self._asset(*asset, "max-age=2592000")
             if r == "api/fonts/progress":
                 app.fonts.reload()
                 return self._json(app.fonts.progress())
@@ -292,11 +302,14 @@ def urls(st: dict) -> dict:
 
 
 def serve(pdir: Path, port: int | None = None, host: str = "127.0.0.1", tunnel: bool = False,
-          new_token: bool = False, embed: bool = True, wait: float = 25.0) -> dict:
+          new_token: bool = False, embed: bool | None = None, wait: float = 25.0) -> dict:
     from . import tunnel as T
     pdir = Path(pdir)
     st = read_json(state_path(pdir), {}) or {}
-    if st.get("port") and st.get("token") and not new_token and _healthy(st, host):
+    if embed is None:
+        embed = st.get("embed") is not False
+    if (st.get("port") and st.get("token") and not new_token and st.get("embed") is embed
+            and st.get("asset_policy") == ASSET_POLICY and _healthy(st, host)):
         reused = True
     else:
         reused = False
@@ -311,7 +324,9 @@ def serve(pdir: Path, port: int | None = None, host: str = "127.0.0.1", tunnel: 
         env = {**os.environ, **blas_env()}    # small BLAS pools: refits / meter do not fight the image embedding
         env["PYTHONPATH"] = str(toolkit_root()) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
         cmd = [sys.executable, "-m", "slop.taste.server", "--project-dir", str(pdir), "--port", str(port),
-               "--host", host, f"--token={token}", "--taste-root", str(taste_dir(pdir))]   # a token may start with - + ([] if embed else ["--no-embed"])
+               "--host", host, f"--token={token}", "--taste-root", str(taste_dir(pdir))]
+        if not embed:
+            cmd.append("--no-embed")
         p = T.spawn_detached(cmd, log, env=env, cwd=str(toolkit_root()))
         t0 = time.monotonic()
         while time.monotonic() - t0 < wait and not health(port, token, host=host):
@@ -327,7 +342,7 @@ def serve(pdir: Path, port: int | None = None, host: str = "127.0.0.1", tunnel: 
                             "Re-run without --port (a free port is picked), or run `slop taste serve --foreground` "
                             "to see the error")
         st = {"pid": p.pid, "port": port, "host": host, "token": token, "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
-              "tunnel": {}}
+              "tunnel": {}, "embed": embed, "asset_policy": ASSET_POLICY}
         write_json(state_path(pdir), st)      # recorded as soon as it is healthy: `stop` / `status` always find it
     tunnel_error = None
     if tunnel and not (st.get("tunnel", {}).get("pid") and T.pid_alive(st["tunnel"]["pid"])):

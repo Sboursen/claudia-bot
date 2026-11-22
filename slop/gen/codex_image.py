@@ -28,6 +28,7 @@ The scratch folder agents/imagegen/<stamp> is deleted after a success and kept (
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -86,19 +87,15 @@ def sniff_ext(data: bytes) -> str | None:
     return None
 
 
-def image_size(path: Path) -> list[int] | None:
+def image_size(data: bytes) -> list[int] | None:
     try:
         from PIL import Image
-        with Image.open(path) as im:
+        with Image.open(io.BytesIO(data)) as im:
             return [int(im.width), int(im.height)]
     except Exception:  # noqa: BLE001 - PIL missing or unreadable: fall back to the PNG header
         pass
-    try:
-        b = Path(path).read_bytes()[:32]
-        if b[:8] == b"\x89PNG\r\n\x1a\n":
-            return [int.from_bytes(b[16:20], "big"), int.from_bytes(b[20:24], "big")]
-    except OSError:
-        pass
+    if len(data) >= 24 and data[:8] == b"\x89PNG\r\n\x1a\n":
+        return [int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")]
     return None
 
 
@@ -426,33 +423,39 @@ def _ref_arg(pdir: Path, s: str) -> str:
 
 def generate_one(pdir: Path, *, prompt: str, aspect: str | None = "16:9", refs: list[str] | None = None,
                  out_dir: Path | None = None, out: Path | None = None, timeout: float = DEFAULT_TIMEOUT_S,
-                 meta: dict | None = None) -> dict:
+                 meta: dict | None = None, project_refs: list[str] | None = None,
+                 ref_ids: list[str] | None = None, project_output: bool = False) -> dict:
     """refs: image FILES (resolved by ref_files); the sidecar records them as project-relative ids."""
     from .images import ref_id, reserve
+    from .project_inputs import stage_references, write_candidate
     if out is None and out_dir is None:
         raise SlopError("say where the image goes: --plate NAME (plates/cands/NAME/<k>.png) or --out FILE")
     refs = [str(r) for r in (refs or [])]
     try:
-        r = run_codex(build_prompt(prompt, aspect, len(refs)), refs, timeout)
+        with stage_references(pdir, refs, project_refs) as staged:
+            r = run_codex(build_prompt(prompt, aspect, len(refs)), staged, timeout)
     except CodexImageError as e:
         ledger.record(pdir, provider=PROVIDER, model=MODEL, kind="image", est_usd=0.0, units={"n": 0, "plan": "chatgpt"},
                       status="failed", note=f"plan: {e.kind}: {str(e)[:120]}")
         raise
     side = {"model": MODEL, "provider": PROVIDER, "prompt": prompt.strip(), "aspect_ratio": aspect, "resolution": None,
-            "quality": None, "seed": None, "refs": [ref_id(pdir, r) for r in refs], "cost_usd": 0.0, "est_usd": 0.0,
+            "quality": None, "seed": None, "refs": ref_ids if ref_ids is not None else [ref_id(pdir, r) for r in refs],
+            "cost_usd": 0.0, "est_usd": 0.0,
             "plan": "chatgpt",
-            "thread_id": r["thread_id"], "revised_prompt": r["revised_prompt"], "secs": r["secs"], **(meta or {})}
-    if out is not None:
+            "thread_id": r["thread_id"], "revised_prompt": r["revised_prompt"], "secs": r["secs"],
+            "size": image_size(r["data"]), **(meta or {})}
+    if project_output:
+        dst = write_candidate(pdir, Path(out_dir), r["ext"], r["data"], side)
+    elif out is not None:
         dst = Path(out)
         if not dst.suffix:
             dst = dst.with_suffix(r["ext"])
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_bytes(r["data"])
+        dst.with_suffix(".json").write_text(json.dumps(side, indent=1), encoding="utf-8")
     else:
         dst = reserve(Path(out_dir), r["ext"], side)
         dst.write_bytes(r["data"])
-    side["size"] = image_size(dst)
-    dst.with_suffix(".json").write_text(json.dumps(side, indent=1), encoding="utf-8")
     if r.get("scratch"):                                 # the picture is saved: the run's scratch folder can go
         shutil.rmtree(r["scratch"], ignore_errors=True)
     row = ledger.record(pdir, provider=PROVIDER, model=MODEL, kind="image", est_usd=0.0,
@@ -492,6 +495,7 @@ def plan_jobs(pdir: Path, jobs: list[dict], only: list[str] | None, missing: boo
     """refs: the batch's --ref, added to every job's own "refs" (the lead anchor `slop plates book --anchor` writes);
     resume counts only images made from the same prompt with the same references."""
     from .images import any_candidates, job_prompt, made_for
+    from .project_inputs import candidate_directory
     extra = ref_files(pdir, refs) if refs else []
     if only:
         known = {j["plate"] for j in jobs}
@@ -501,6 +505,7 @@ def plan_jobs(pdir: Path, jobs: list[dict], only: list[str] | None, missing: boo
     rows, taken = [], {}
     for i, j in enumerate(jobs):
         plate = j["plate"]
+        candidate_directory(pdir, plate)
         asp = j.get("aspect") or "16:9"
         try:
             n = int(j.get("n") or 1)
@@ -517,6 +522,7 @@ def plan_jobs(pdir: Path, jobs: list[dict], only: list[str] | None, missing: boo
             rs = _job_refs(pdir, j, extra)
             ids = [r["id"] for r in rs]
             row["refs"], row["ref_src"] = ids, [r["src"] for r in rs]
+            row["project_ref_src"] = [r["src"] for r in rs if r.get("project_file")]
             if j.get("anchor"):
                 row["anchor"] = j["anchor"]
             key = (plate, prompt.strip(), asp, tuple(sorted(ids)))
@@ -534,6 +540,7 @@ def run_jobs(pdir: Path, jobs_file: Path, *, only: list[str] | None = None, miss
              refs: list[str] | None = None, timeout: float = DEFAULT_TIMEOUT_S) -> dict:
     from ..job import write_progress
     from .images import _public_row, _ref_arg as ref_flag, _refs_note, load_jobs
+    from .project_inputs import candidate_directory
     rows = plan_jobs(pdir, load_jobs(pdir, jobs_file), only, missing, refs=refs)
     todo = [r for r in rows if not r["skip"]]
     n_img = sum(r["need"] for r in todo)
@@ -569,14 +576,16 @@ def run_jobs(pdir: Path, jobs_file: Path, *, only: list[str] | None = None, miss
             write_progress(done=k, total=n_img, msg=f"codex image {k + 1}/{n_img}: {r['plate']}")
             try:
                 g = generate_one(pdir, prompt=r["prompt"], aspect=r["aspect"], refs=r.get("ref_src") or None,
-                                 out_dir=pdir / "plates" / "cands" / r["plate"], timeout=timeout,
-                                 meta={"job": r["plate"], "jobs_file": rel})
+                                 project_refs=r.get("project_ref_src"), ref_ids=r.get("refs"),
+                                 out_dir=candidate_directory(pdir, r["plate"]), timeout=timeout,
+                                 meta={"job": r["plate"], "jobs_file": rel}, project_output=True)
                 made.append(g["file"])
                 streak = 0
-            except CodexImageError as e:
-                failed.append({"plate": r["plate"], "kind": e.kind, "error": str(e)[:300]})
+            except SlopError as e:
+                kind = e.kind if isinstance(e, CodexImageError) else "input"
+                failed.append({"plate": r["plate"], "kind": kind, "error": str(e)[:300]})
                 streak += 1
-                if e.kind in ("limit", "auth") or streak >= 2:
+                if kind in ("limit", "auth", "input") or streak >= 2:
                     stop = f"{r['plate']}: {e}"
             k += 1
     write_progress(done=k, total=n_img, msg="done", final=True)
@@ -604,7 +613,7 @@ def _abs(pdir: Path, s: str | None) -> str | None:
     if not s:
         return s
     p = util.input_path(pdir, s)
-    return str(Path(p).resolve()) if p is not None else s
+    return str(Path(p).absolute()) if p is not None else s
 
 
 def _job_words(a, pdir: Path) -> list[str]:

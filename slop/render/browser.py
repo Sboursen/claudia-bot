@@ -12,11 +12,12 @@ import re
 import sys
 
 from ..config import SlopError, slop_home
+from .isolation import RenderAssets
 
-# software GL (no GPU on the box): ANGLE on SwiftShader; file access for the project's media
+# Software GL on the render box. Keep Chromium's process sandbox enabled.
 # --js-flags=--expose-gc: the engine's image cache (core.js dropCache) runs a GC after it drops images, so decoded plates
 # are freed at once (V8 does not count Blink's image memory and would otherwise wait).
-LAUNCH_ARGS = ["--no-sandbox", "--allow-file-access-from-files", "--use-gl=angle", "--use-angle=swiftshader",
+LAUNCH_ARGS = ["--use-gl=angle", "--use-angle=swiftshader",
                "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist", "--js-flags=--expose-gc"]
 BOOT_TIMEOUT_MS = 120_000
 FRAME_TIMEOUT_MS = 180_000
@@ -65,11 +66,11 @@ def launch(p):
     errors = []
     for kw in attempts:
         try:
-            return p.chromium.launch(args=LAUNCH_ARGS, **kw)
+            return p.chromium.launch(args=LAUNCH_ARGS, chromium_sandbox=True, **kw)
         except Exception as e:  # noqa: BLE001 — try the next browser
             errors.append(f"{kw or 'bundled chromium'}: {str(e).strip().splitlines()[0][:200]}")
-    raise SlopError("could not start a browser — " + " | ".join(errors) +
-                    ". Fix: run `python -m playwright install chromium` (or install google-chrome), then retry.")
+    raise SlopError("could not start a browser with the Chromium sandbox enabled — " + " | ".join(errors) +
+                    ". Check that the render host supports the Chromium sandbox and has a compatible browser.")
 
 
 def _race(expr: str, ms: int) -> str:
@@ -90,15 +91,29 @@ class EnginePage:
         self._open()
 
     def _open(self) -> None:
+        assets = RenderAssets(self.spec["engine_root"], self.spec["project_root"], self.spec["trust_project_scripts"])
         self.browser = launch(self.p)
-        pg = self.browser.new_page(viewport={"width": int(self.spec["w"]), "height": int(self.spec["h"])})
-        pg.on("console", self._on_console)
-        pg.on("pageerror", lambda e: self.errors.append(str(e)[:500]))
-        pg.add_init_script(self.spec["init"])
-        pg.goto(self.spec["url"], wait_until="load", timeout=BOOT_TIMEOUT_MS)
-        pg.evaluate(_race("() => window.booted || Promise.reject(new Error('the engine page did not boot (window.booted missing)'))",
-                          BOOT_TIMEOUT_MS), None)
-        self.page = pg
+        try:
+            context = self.browser.new_context(
+                viewport={"width": int(self.spec["w"]), "height": int(self.spec["h"])},
+                service_workers="block",
+                accept_downloads=False,
+            )
+            context.route("**/*", assets.handle)
+            context.route_web_socket("**/*", lambda websocket: websocket.close())
+            pg = context.new_page()
+            pg.on("console", self._on_console)
+            pg.on("pageerror", lambda e: self.errors.append(str(e)[:500]))
+            pg.add_init_script(self.spec["browser_init"])
+            response = pg.goto(self.spec["browser_url"], wait_until="load", timeout=BOOT_TIMEOUT_MS)
+            if response is None or response.status != 200:
+                raise SlopError("the isolated renderer could not load the engine page")
+            pg.evaluate(_race("() => window.booted || Promise.reject(new Error('the engine page did not boot'))",
+                              BOOT_TIMEOUT_MS), None)
+            self.page = pg
+        except BaseException:
+            self.close()
+            raise
 
     def _on_console(self, m) -> None:
         if m.type in ("error", "warning") and len(self.console) < 200:

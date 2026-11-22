@@ -138,6 +138,11 @@ Then, for the test batch and for every batch after it:
 
 ---
 
+Image jobs use bounded local files for `prompt_file` and image references. Keep them inside the selected project
+as regular files. Move linked inputs into the project before preparing a batch. The secure batch I/O requires
+an OS with no-follow directory handles. Review a job's prompt, attachments, and destination before approving it,
+especially when the Codex provider will process project-supplied instructions.
+
 ## 3. Identity with API models
 
 The text canon is still the identity (`50-plates-midjourney.md` §5): paste `lead.canon` (or `lead.far` for far shots)

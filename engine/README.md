@@ -31,19 +31,30 @@ engine/
 
 ## Loading (how a project is rendered)
 
-`engine/index.html?project=<file URL of the project dir>&w=1920&h=1080` — `slop render` builds this URL and also
-injects `window.SLOP = {project, engine, w, h, assets, deviceFiles, data}` and `window.PROJECT` (a subset of
-project.json) before the page runs. The page:
+`slop render` requires sandboxed Chromium and serves the page through an intercepted HTTPS origin inside the
+browser context. There is no listening server. The renderer rejects other requests intercepted by the browser
+context and closes WebSockets. The origin serves only trusted engine resources and selected raster images, fonts and
+render JSON under the project's `engine/`, `plates/` and `fonts/` directories. Symlinked resource paths and external
+asset URLs cannot be loaded. Copy the necessary assets into the project before rendering.
+Render audio must also be a regular file inside the project. `slop song ingest` copies and converts the chosen
+song to `audio/song.wav`.
+
+The default renderer reads exports in the form `window.NAME = <JSON>;` as data and skips custom project JavaScript.
+It injects `window.SLOP` and `window.PROJECT` before the page runs. Set the local environment variable
+`SLOP_RENDER_TRUST_PROJECT_SCRIPTS=1` for projects whose custom code you reviewed and trust. That mode keeps the
+same request policy and permits project JavaScript under `engine/`, including inline code. Browser policies cover
+the render context. Use a dedicated low-privilege operating-system or VM boundary and explicit egress restrictions
+for sensitive workloads. The page:
 
 1. sets `<base href="<project>/engine/">` — every **relative** media path (plates, clip frames, mattes, fx sequences,
    chapter files) resolves against the project's `engine/` folder, exactly like the original per-project page;
-2. loads the project's data scripts from `<project>/engine/` (or `<project>/engine/assets/`), any of:
+2. uses the project's exported data from `<project>/engine/` (or `<project>/engine/assets/`), any of:
    `project.js beats.js lyrics.js hits.js spectrum.js clips.js plates.js tracks.js fx.js shots.js edl.js`
    (written by `slop edit export`). When one is missing, `slop render` injects the raw contract JSON instead
    (`analysis/beats.json` → BEATS, `analysis/hits.json` → HITS, `board/shots.json` → SHOTS, `edit/edl.json` → EDL,
    `analysis/words.json` → LYR with one token per sung word);
 3. loads the engine (`fonts/fonts.js`, then `src/core.js … src/timeline.js`) and calls `ENGINE.prepareData()`;
-4. loads the project layer if present: `<project>/engine/common.js`, then `scenes.js`, `ch/_index.js` (bespoke chapter
+4. in explicit trusted-script mode, loads the project layer if present: `<project>/engine/common.js`, then `scenes.js`, `ch/_index.js` (bespoke chapter
    code; `ch/_index.js` may `document.write` its chapter files with relative paths);
 5. loads the device library (`src/devices/index.js` if it exists — it loads its files in its own order; without it,
    `src/shots.js` loads its library itself, or, when `src/shots.js` is absent too, every `src/devices/**/*.js` in sorted
@@ -290,6 +301,6 @@ slop render vertical --method crop     # a PREVIEW cropped from the master frame
 The lyric gate command is `slop render lyrics`. Long render commands write their progress to `$SLOP_PROGRESS_FILE`
 (`command`, `step` k/n, `state`): only `done`, `stopped` or `failed` mean the command is over; `stage_done` /
 `stage_stopped` mark one step of several. Run them as background jobs (`slop job start -- render frames …`).
-Chromium flags: `--use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader --ignore-gpu-blocklist
---no-sandbox --allow-file-access-from-files`. Each worker is its own browser (~1.7 GiB RAM), recycled every 200 frames,
-one retry per frame on a fresh page. `SLOP_ENGINE_SHOTS=0` renders with the engine's stub instead of `src/shots.js`.
+Chromium uses sandboxed processes and SwiftShader for software WebGL. Each worker is its own browser (~1.7 GiB
+RAM), recycled every 200 frames, with one retry per frame on a fresh page. `SLOP_ENGINE_SHOTS=0` renders with the
+engine's stub instead of `src/shots.js`.

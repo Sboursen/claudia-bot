@@ -15,18 +15,21 @@ sessions/picks/ranking, pair sheets. What stays in each project (``<project>/tas
 look-bible.md, boards/, verdicts.jsonl (this project's verdicts; rule verdicts are also copied to the user profile so
 they carry over), applied.json.
 
-Copies: image files are hard-linked when the file system allows it (they are never modified), every log is copied
+Copies: image files are copied into the destination profile, every log is copied
 (they are appended to). Merges are by id: pool rows by image id/sha1, taps and font picks by event id, verdicts by
 verdict id; vectors only when both sides use the same embedding model (else `slop taste embed` re-embeds, cheaply from
 the per-image cache).
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from pathlib import Path
 
 from ..config import SlopError
+from .assets import FONT_LIMIT, JPEG_LIMIT, read_file, write_file
+from .pool import valid_image_id
 from .store import (PROFILE_KINDS, has_data, link_path, now_iso, profile_root, project_taste_dir, read_json,
                     read_jsonl, read_link, user_profile_dir, write_json)
 
@@ -158,16 +161,6 @@ def describe(i: dict) -> str:
 
 # ---------------------------------------------------------------- copy / merge between roots
 
-def _link_or_copy(src: Path, dst: Path) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    if dst.exists():
-        return
-    try:
-        os.link(src, dst)                  # images are never modified in place: a hard link is a safe copy
-    except OSError:
-        shutil.copy2(src, dst)
-
-
 def _append_rows(path: Path, rows: list[dict]) -> None:
     import json
     if not rows:
@@ -200,7 +193,7 @@ def _merge_pool(src: Path, dst: Path) -> int:
     def live(rows):
         out: dict[str, dict] = {}
         for r in rows:
-            if r.get("id"):
+            if isinstance(r, dict) and valid_image_id(r.get("id")):
                 if r.get("removed"):
                     out.pop(r["id"], None)
                 else:
@@ -212,9 +205,14 @@ def _merge_pool(src: Path, dst: Path) -> int:
     for iid, r in sp.items():
         if iid in dp or (r.get("sha1") and r["sha1"] in shas):
             continue
-        img = src / "pool" / "images" / f"{iid}.jpg"
-        if img.is_file():
-            _link_or_copy(img, dst / "pool" / "images" / f"{iid}.jpg")
+        relative = Path("pool", "images", f"{iid}.jpg")
+        try:
+            data = read_file(src.parent, Path(src.name, relative), JPEG_LIMIT)
+        except (OSError, ValueError):
+            continue
+        if not data.startswith(b"\xff\xd8\xff"):
+            continue
+        write_file(dst.parent, Path(dst.name, relative), data)
         new.append(r)
     _append_rows(dst / "pool" / "pool.jsonl", new)
     return len(new)
@@ -258,9 +256,30 @@ def copy_into(src: Path, dst: Path) -> dict:
            "taps": _merge_events(src / "taps.jsonl", dst / "taps.jsonl"),
            "font_picks": _merge_events(src / "fonts" / "taps.jsonl", dst / "fonts" / "taps.jsonl")}
     for f in ("session.json", "frame.jpg", "ranking.json"):
-        s, d = src / "fonts" / f, dst / "fonts" / f
-        if s.is_file() and not d.exists():
-            shutil.copy2(s, d)
+        relative = Path("fonts", f)
+        if (dst / relative).exists():
+            continue
+        try:
+            data = read_file(src.parent, Path(src.name, relative), JPEG_LIMIT)
+        except OSError:
+            continue
+        if f == "session.json":
+            from .fonts import FONT_ASSET, MAX_FONTS, SESSION_VERSION
+            try:
+                session = json.loads(data)
+                faces = session["fonts"]
+                if session["version"] != SESSION_VERSION or not 2 <= len(faces) <= MAX_FONTS:
+                    continue
+                for face in faces:
+                    asset = face["asset"]
+                    if not FONT_ASSET.fullmatch(asset):
+                        raise ValueError("invalid preview filename")
+                    path = Path("fonts", "assets", asset)
+                    content = read_file(src.parent, Path(src.name, path), FONT_LIMIT)
+                    write_file(dst.parent, Path(dst.name, path), content)
+            except (KeyError, OSError, TypeError, ValueError):
+                continue
+        write_file(dst.parent, Path(dst.name, relative), data)
     st_s, st_d = read_json(src / "stats.json", {}) or {}, read_json(dst / "stats.json", {}) or {}
     if st_s:
         write_json(dst / "stats.json", {**st_s, **st_d})

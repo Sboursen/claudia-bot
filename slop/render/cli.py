@@ -112,7 +112,7 @@ def cmd_info(a) -> dict:
     if warn:
         text += "\n" + "\n".join("  ! " + x for x in warn)
     ok = not info.get("page_errors") and info.get("scenes", 0) > 0 and not missing and not info.get("fontsFailed")
-    return {"ok": ok, "project": str(pdir), "url": spec["url"], "info": info, "assets": spec["assets"],
+    return {"ok": ok, "project": str(pdir), "url": spec["browser_url"], "info": info, "assets": spec["assets"],
             "fallbacks": spec["fallbacks"], "missing_media": [media_label(m["src"]) for m in missing],
             "warnings": warn, "text": text}
 

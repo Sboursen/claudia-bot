@@ -647,7 +647,8 @@ def _js_block(doc: str, needle: str) -> str:
 
 @pytest.mark.slow
 @pytest.mark.skipif(not DEMO.is_dir(), reason="engine demo fixture not present")
-def test_chapter_template_renders_in_the_engine(tmp_path: Path) -> None:
+def test_chapter_template_renders_in_the_engine(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("SLOP_RENDER_TRUST_PROJECT_SCRIPTS", "1")
     pytest.importorskip("playwright.sync_api")
     from slop.render import project as P
     from slop.render.browser import EnginePage

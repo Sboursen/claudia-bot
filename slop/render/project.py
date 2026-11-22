@@ -9,9 +9,11 @@ import re
 import subprocess
 import wave
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
+from urllib.request import url2pathname
 
-from ..config import SlopError, engine_dir, load_project
+from ..config import SlopError, engine_dir
+from .isolation import ENGINE_URL, PROJECT_URL, project_asset_url, read_project_file, scoped_path
 
 # data scripts the page loads from <project>/engine/ (or <project>/engine/assets/), in this order
 DATA_NAMES = ["project", "beats", "lyrics", "hits", "spectrum", "clips", "plates", "tracks", "fx", "shots", "edl"]
@@ -56,19 +58,39 @@ def _read_json(path: Path):
         return None
 
 
+def _read_project_json(pdir: Path, rel: str):
+    raw = read_project_file(pdir, tuple(rel.split("/")))
+    if raw is not None:
+        try:
+            return json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            pass
+    return None
+
+
+def _project_json(pdir: Path) -> dict:
+    data = _read_project_json(pdir, "project.json")
+    if not isinstance(data, dict):
+        raise SlopError("the render project requires a regular project.json file containing a JSON object")
+    return data
+
+
 def asset_files(pdir: Path) -> dict[str, Path]:
     """Existing engine data scripts: name -> path (<project>/engine/<n>.js preferred over engine/assets/<n>.js)."""
+    pdir = pdir.resolve()
     out: dict[str, Path] = {}
     for n in DATA_NAMES:
         for cand in (pdir / "engine" / f"{n}.js", pdir / "engine" / "assets" / f"{n}.js"):
-            if cand.is_file():
+            if scoped_path(pdir, cand.relative_to(pdir).parts) is not None and cand.is_file():
                 out[n] = cand
                 break
     return out
 
 
 def layer_files(pdir: Path) -> list[str]:
-    return [f for f in LAYER_FILES if (pdir / "engine" / f).is_file()]
+    pdir = pdir.resolve()
+    return [f for f in LAYER_FILES if scoped_path(pdir, ("engine", *f.split("/"))) is not None
+            and (pdir / "engine" / f).is_file()]
 
 
 def device_files(shots: bool = True) -> list[str]:
@@ -151,11 +173,11 @@ def fallback_data(pdir: Path, have: set[str]) -> tuple[dict, list[str]]:
     for name, glob, rel in pairs:
         if name in have:
             continue
-        v = _read_json(pdir / rel)
+        v = _read_project_json(pdir, rel)
         if v is not None:
             data[glob] = v
     if "lyrics" not in have:
-        words = _read_json(pdir / "analysis" / "words.json")
+        words = _read_project_json(pdir, "analysis/words.json")
         if words:
             data["LYR"] = lyr_from_words(words)
             warn.append("engine/lyrics.js is missing: lyrics come from analysis/words.json one word per token "
@@ -168,7 +190,7 @@ def fallback_data(pdir: Path, have: set[str]) -> tuple[dict, list[str]]:
         else:
             warn.append("no lyrics: neither engine/lyrics.js nor analysis/words.json exists (the lyric gate checks nothing)")
     if "plates" not in have:
-        picks = _read_json(pdir / "plates" / "picks.json")
+        picks = _read_project_json(pdir, "plates/picks.json")
         if picks:
             data["PLATES"] = plates_from_picks(pdir, picks)
     if "beats" not in have and "BEATS" not in data:
@@ -177,7 +199,7 @@ def fallback_data(pdir: Path, have: set[str]) -> tuple[dict, list[str]]:
 
 
 def project_subset(pdir: Path) -> dict:
-    proj = load_project(pdir)
+    proj = _project_json(pdir)
     out = {k: proj[k] for k in PROJECT_KEYS if k in proj}
     out.setdefault("name", pdir.name)
     out.setdefault("title", proj.get("title") or pdir.name)
@@ -188,7 +210,7 @@ def project_subset(pdir: Path) -> dict:
 
 
 def project_size(pdir: Path) -> tuple[int, int]:
-    size = load_project(pdir).get("size") or [1920, 1080]
+    size = _project_json(pdir).get("size") or [1920, 1080]
     try:
         return int(size[0]), int(size[1])
     except (TypeError, ValueError, IndexError):
@@ -197,15 +219,28 @@ def project_size(pdir: Path) -> tuple[int, int]:
 
 def project_fps(pdir: Path) -> float:
     try:
-        return float(load_project(pdir).get("fps") or 24)
+        return float(_project_json(pdir).get("fps") or 24)
     except (TypeError, ValueError):
         return 24.0
 
 
+RENDER_AUDIO_OPTIONS = ("-protocol_whitelist", "file", "-format_whitelist", "aac,aiff,flac,mov,mp3,ogg,wav")
+
+
 def audio_path(pdir: Path) -> Path:
-    song = load_project(pdir).get("song") or "audio/song.wav"
-    p = Path(song)
-    return p if p.is_absolute() else pdir / p
+    root = pdir.resolve()
+    song = _project_json(root).get("song") or "audio/song.wav"
+    if not isinstance(song, str):
+        raise SlopError("project.json song must be a path inside the project")
+    path = Path(song)
+    try:
+        parts = path.relative_to(root).parts if path.is_absolute() else path.parts
+    except ValueError:
+        parts = ()
+    scoped = scoped_path(root, parts)
+    if scoped is None or (scoped.exists() and not scoped.is_file()):
+        raise SlopError("render audio must be a regular file inside the project. Add it with `slop song ingest`.")
+    return scoped
 
 
 def audio_duration(path: Path) -> float | None:
@@ -217,7 +252,8 @@ def audio_duration(path: Path) -> float | None:
     except (wave.Error, EOFError, OSError):
         pass
     try:
-        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)],
+        r = subprocess.run(["ffprobe", "-v", "error", *RENDER_AUDIO_OPTIONS, "-show_entries", "format=duration",
+                            "-of", "json", str(path)],
                            capture_output=True, text=True, timeout=60)
         return float(json.loads(r.stdout)["format"]["duration"])
     except Exception:  # noqa: BLE001 — probing is best effort
@@ -226,9 +262,12 @@ def audio_duration(path: Path) -> float | None:
 
 def project_duration(pdir: Path) -> float | None:
     """Song duration from the beat map, the storyboard, or the audio (None when nothing says)."""
+    pdir = pdir.resolve()
     have = asset_files(pdir)
     for name, rel in (("beats", "analysis/beats.json"), ("shots", "board/shots.json")):
-        v = read_js_asset(have[name]) if name in have else _read_json(pdir / rel)
+        v = _declarative_export(pdir, have[name], DATA_GLOBALS[name]) if name in have else None
+        if v is None:
+            v = _read_project_json(pdir, rel)
         if isinstance(v, dict) and v.get("duration"):
             try:
                 return float(v["duration"])
@@ -240,7 +279,7 @@ def project_duration(pdir: Path) -> float | None:
 def timemap_end(pdir: Path) -> float | None:
     """The final song's length from edit/timemap.json (the last segment's new_t1), or None."""
     for rel in ("edit/timemap.json", "timemap.json"):
-        v = _read_json(pdir / rel)
+        v = _read_project_json(pdir, rel)
         if isinstance(v, dict) and v.get("segments"):
             try:
                 return max(float(s[1]) for s in v["segments"])
@@ -257,7 +296,7 @@ def render_duration(pdir: Path, timemap: bool = False) -> float | None:
 
 
 # ------------------------------------------------------------ input fingerprint (stale-frame detection) ------------
-FINGERPRINT_VERSION = 1
+FINGERPRINT_VERSION = 2
 _ENGINE_CODE_GLOBS = ["index.html", "src/**/*.js", "fonts/fonts.js"]
 
 
@@ -315,13 +354,15 @@ def inputs_fingerprint(pdir: Path, spec: dict, timemap: bool = False) -> dict:
     parts["project.json"] = _sha(json.dumps(sub, sort_keys=True, default=str).encode())
     parts["size"] = f"{spec['w']}x{spec['h']}@{spec['fps']}"
     parts["renderer"] = "shots" if spec.get("shots", True) else "stub"
-    for glob, val in sorted((spec.get("data") or {}).items()):
+    parts["project scripts"] = "trusted" if spec.get("trust_project_scripts") else "declarative"
+    for glob, val in sorted((spec.get("browser_fallbacks") or {}).items()):
         parts[f"fallback:{glob}"] = _sha(json.dumps(val, sort_keys=True, default=str).encode())
+    pdir = pdir.resolve()
     eng = pdir / "engine"
     media: list[str] = []
     if eng.is_dir():
         for f in sorted(eng.rglob("*")):
-            if not f.is_file():
+            if scoped_path(pdir, f.relative_to(pdir).parts) is None or not f.is_file():
                 continue
             rel = f.relative_to(pdir).as_posix()
             if f.suffix.lower() in (".js", ".mjs", ".json"):
@@ -346,7 +387,7 @@ def inputs_fingerprint(pdir: Path, spec: dict, timemap: bool = False) -> dict:
     eng_r = eng.resolve()
     for q in sorted(refs, key=str):
         qr = q.resolve()
-        if eng_r not in qr.parents:
+        if pdir in qr.parents and eng_r not in qr.parents:
             media.append(f"{qr.as_posix()}={_stat_sig(qr)}")
     parts["media"] = _sha("\n".join(media).encode())
     if timemap:
@@ -385,6 +426,98 @@ def current_fingerprint(pdir: Path, rec: dict) -> dict:
     return inputs_fingerprint(pdir, spec, timemap=bool(rec.get("timemap")))
 
 
+def _declarative_export(pdir: Path, f: Path, name: str):
+    raw = read_project_file(pdir, f.relative_to(pdir).parts)
+    if raw is None:
+        return None
+    try:
+        data = raw.decode("utf-8").strip()
+        if name == "SHOTS":
+            data = data.removesuffix("window.SHOTLIST = window.SHOTS;").rstrip()
+        match = re.match(r"window\." + re.escape(name) + r"\s*=\s*", data)
+        return json.loads(data[match.end():-1]) if match and data.endswith(";") else None
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        return None
+
+
+def _browser_json(value) -> str:
+    def no_prototype_keys(obj):
+        if isinstance(obj, dict):
+            return {k: no_prototype_keys(v) for k, v in obj.items()
+                    if k not in {"__proto__", "constructor", "prototype"}}
+        if isinstance(obj, list):
+            return [no_prototype_keys(v) for v in obj]
+        if isinstance(obj, float) and not math.isfinite(obj):
+            return None
+        return obj
+
+    return "JSON.parse(" + json.dumps(json.dumps(no_prototype_keys(value))) + ")"
+
+
+def _browser_asset_ref(value, pdir: Path):
+    if not isinstance(value, str) or not value:
+        return value
+    if value.lower().startswith("file:"):
+        try:
+            local = urlsplit(value)
+            if local.netloc:
+                return PROJECT_URL + "unavailable"
+            path = Path(url2pathname(local.path))
+        except ValueError:
+            return PROJECT_URL + "unavailable"
+    elif Path(value).is_absolute():
+        path = Path(value)
+    else:
+        return value
+    return (project_asset_url(path, pdir) if path is not None else None) or PROJECT_URL + "unavailable"
+
+
+def _browser_config(pdir: Path, slop: dict, proj: dict, have: dict, trust_scripts: bool):
+    warnings: list[str] = []
+    declared = {}
+    for name, path in have.items():
+        value = _declarative_export(pdir, path, DATA_GLOBALS[name])
+        if value is None:
+            if not trust_scripts:
+                warnings.append(f"skipped non-declarative render export {path.relative_to(pdir)}")
+        else:
+            declared[name] = value
+    active_exports = set(have) if trust_scripts else set(declared)
+    defaults, fallback_warnings = fallback_data(pdir, active_exports)
+    data = {**defaults, **{DATA_GLOBALS[name]: val for name, val in declared.items() if name != "project"}}
+    if isinstance(declared.get("project"), dict):
+        proj = declared["project"]
+    for glob, keys in (("PLATES", ("file", "src", "depth", "matte")), ("CLIPS", ("dir",)), ("FXSEQ", ("dir",))):
+        if isinstance(data.get(glob), dict):
+            data[glob] = {
+                k: {field: _browser_asset_ref(x, pdir) if field in keys else x for field, x in val.items()}
+                if isinstance(val, dict) else val for k, val in data[glob].items()
+            }
+    if isinstance(proj.get("font_files"), list):
+        proj = {**proj, "font_files": [{**f, "file": _browser_asset_ref(f.get("file"), pdir)}
+                                     for f in proj["font_files"] if isinstance(f, dict)]}
+    if slop["layer"] and not trust_scripts:
+        warnings.append("custom project render code was skipped. For locally reviewed projects, explicitly set "
+                        "SLOP_RENDER_TRUST_PROJECT_SCRIPTS=1 to load it")
+    config = {
+        **slop,
+        "engine": ENGINE_URL,
+        "project": PROJECT_URL,
+        "projectEngine": PROJECT_URL + "engine/",
+        "assets": [p.relative_to(pdir / "engine").as_posix() for key, p in have.items()
+                   if trust_scripts and key not in declared],
+        "layer": slop["layer"] if trust_scripts else [],
+        "data": {glob: data[glob] for glob in defaults},
+    }
+    # Match the legacy order: load the project's exported globals before the trusted engine starts.
+    init = "window.SLOP = " + _browser_json(config) + ";\nwindow.PROJECT = " + _browser_json(proj) + ";\n"
+    for name in declared:
+        glob = DATA_GLOBALS[name]
+        if glob != "PROJECT":
+            init += f"window.{glob} = " + _browser_json(data[glob]) + ";\n"
+    return init, fallback_warnings + warnings, config["data"], active_exports
+
+
 def page_spec(pdir: Path, w: int | None = None, h: int | None = None, shots: bool | None = None) -> dict:
     """Everything needed to open the engine page for a project: url, init script, warnings, size.
 
@@ -392,13 +525,15 @@ def page_spec(pdir: Path, w: int | None = None, h: int | None = None, shots: boo
     default: $SLOP_ENGINE_SHOTS=0 also skips it."""
     if shots is None:
         shots = os.environ.get("SLOP_ENGINE_SHOTS", "1").strip().lower() not in ("0", "false", "no", "off")
-    idx = engine_dir() / "index.html"
+    pdir = pdir.resolve()
+    engine = engine_dir().resolve()
+    idx = engine / "index.html"
     if not idx.is_file():
         raise SlopError(f"engine page missing: {idx} (reinstall the toolkit: bin/setup.sh)")
     pw, ph = project_size(pdir)
     w, h = int(w or pw), int(h or ph)
     have = asset_files(pdir)
-    data, warn = fallback_data(pdir, set(have))
+    data, _ = fallback_data(pdir, set(have))
     eng_dir = pdir / "engine"
     slop = {
         "project": dir_url(pdir), "projectEngine": dir_url(eng_dir) if eng_dir.is_dir() else dir_url(pdir) + "engine/",
@@ -413,9 +548,15 @@ def page_spec(pdir: Path, w: int | None = None, h: int | None = None, shots: boo
     init = ("window.SLOP = " + json.dumps(slop, ensure_ascii=False) + ";\n"
             "window.PROJECT = Object.assign(window.PROJECT || {}, " + json.dumps(proj, ensure_ascii=False) + ");\n")
     url = file_url(idx) + f"?w={w}&h={h}&project=" + quote(dir_url(pdir), safe="")
-    untimed = untimed_words(_read_json(pdir / "analysis" / "words.json") or {}) if "lyrics" not in have else []
-    return {"url": url, "init": init, "warnings": warn, "w": w, "h": h, "fps": project_fps(pdir),
-            "assets": sorted(have), "fallbacks": sorted(data), "untimed": untimed, "data": data, "shots": bool(shots)}
+    trust_scripts = os.environ.get("SLOP_RENDER_TRUST_PROJECT_SCRIPTS") == "1"
+    browser_init, browser_warnings, browser_fallbacks, browser_exports = _browser_config(pdir, slop, proj, have, trust_scripts)
+    untimed = untimed_words(_read_project_json(pdir, "analysis/words.json") or {}) if "lyrics" not in browser_exports else []
+    return {"url": url, "init": init, "warnings": browser_warnings, "w": w, "h": h, "fps": project_fps(pdir),
+            "assets": sorted(browser_exports), "fallbacks": sorted(browser_fallbacks), "untimed": untimed, "data": data,
+            "shots": bool(shots),
+            "engine_root": engine, "project_root": pdir, "trust_project_scripts": trust_scripts,
+            "browser_url": ENGINE_URL + f"index.html?w={w}&h={h}", "browser_init": browser_init,
+            "browser_fallbacks": browser_fallbacks}
 
 
 def cache_mib() -> float | None:

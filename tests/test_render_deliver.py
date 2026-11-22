@@ -195,9 +195,10 @@ def test_layer_check_fails_a_bare_shot(tmp_path, capsys):
     assert "--kind marks" in bad["s003"]["fix"] and "--line" not in bad["s003"]["fix"]     # s003 sings no line
 
 
-def test_layer_check_bespoke_chapter_scenes(tmp_path, capsys):
+def test_layer_check_bespoke_chapter_scenes(tmp_path, capsys, monkeypatch):
     """A chapter scene drawn by the project's own code: below the rule and silent → UNVERIFIED (not a board fix);
     one that declares its layers with ENGINE.noteLayer is judged like any shot."""
+    monkeypatch.setenv("SLOP_RENDER_TRUST_PROJECT_SCRIPTS", "1")
     d = tmp_path / "demo-project"
     shutil.copytree(FIX / "demo-project", d)
     # <project>/engine/scenes.js is the project layer the page loads before the default renderer (index.html step 3)
@@ -254,7 +255,7 @@ def test_decode_refusal_fallback(demo):
     from slop.render import project as P
     from slop.render.browser import EnginePage
     from slop.render.frames import _sync_playwright
-    plate = (demo / "plates" / "grad-a.jpg").resolve().as_uri()
+    plate = "../plates/grad-a.jpg"
     with _sync_playwright()() as p:
         with EnginePage(p, P.page_spec(demo)) as pg:
             r = pg.page.evaluate("""async (good) => {
