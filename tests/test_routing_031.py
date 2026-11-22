@@ -1,6 +1,6 @@
 """0.3.1: the routing audit's fixes. The production (Claude Code or Codex) gets the toolkit's keys because it is the
 spender; relay setup picks the engine the person has; Midjourney jobs are one prompt each, with the plate it is for;
-Grok's text view of a job has every field; a changed brief is read again; an update keeps the model; the scorer runs
+Grok's text view of a job has every field; a changed brief is read again; the scorer runs
 without the cmudict package; login shells load env.sh."""
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from slop import relay, update
+from slop import relay
 
 import test_relay as RT  # noqa: E402  (its fake engine and helpers)
 K = RT.K
@@ -141,21 +141,6 @@ def test_a_changed_brief_is_read_again(tmp_path, monkeypatch):
     (wd / "CLAUDE.md").write_text("brief two\n", encoding="utf-8")
     assert "it changed since you last read it: read it again now" in relay._prompt(wd, {"engine": "claude"}, 3, [],
                                                                                     None)
-
-
-def test_an_update_keeps_the_persons_model(tmp_path, monkeypatch):
-    monkeypatch.setenv("SLOP_HOME", str(tmp_path / "home"))
-    rd = tmp_path / "home" / "relay"
-    rd.mkdir(parents=True)
-    (rd / "config.json").write_text(json.dumps({"engine": "claude", "model": "opus-custom"}), encoding="utf-8")
-    seen = {}
-
-    def run(argv, **kw):
-        seen["argv"] = argv
-        return subprocess.CompletedProcess(argv, 0, json.dumps({"ok": True}), "")
-    monkeypatch.setattr(update.subprocess, "run", run)
-    assert update._refresh_brief() == {"ok": True}
-    assert seen["argv"][-4:] == ["--engine", "claude", "--model", "opus-custom"]
 
 
 def test_the_scorer_runs_without_the_cmudict_package(tmp_path):

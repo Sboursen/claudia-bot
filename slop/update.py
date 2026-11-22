@@ -2,14 +2,13 @@
 
   slop update check [--force]                  this checkout's version and the newest release (the v* tags on its
                                                origin); one network call a day at most (--force: now)
-  slop update apply [--to VERSION] [--force]   fetch the tags, check out the newest (or VERSION), repair the install,
-                                               refresh the production brief; prints what changed (CHANGELOG.md) and
-                                               the one step left for Grok: re-apply skills/dist/recipe.json to itself.
-                                               Refused while the production works (--force overrides)
+  slop update apply --commit SHA [--to VERSION] [--force]
+                                               fetch tags and check out a previously reviewed release commit.
+                                               Refused while the production works (--force overrides that check).
   slop update seen                             the reminder for the newest release was shown
 
 The reminder rides on `slop relay read`: an `update` field with one line, once per new release, from the daily check
-(SLOP_UPDATE_CHECK=0 turns it off). Nothing updates by itself: the person says "update".
+(SLOP_UPDATE_CHECK=0 turns it off). Applying a release requires its independently reviewed full Git ID.
 State: $SLOP_HOME/update.json {checked, latest, notified}.
 """
 from __future__ import annotations
@@ -18,7 +17,6 @@ import json
 import os
 import re
 import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -27,6 +25,7 @@ from .config import SlopError, slop_home, toolkit_root
 
 CHECK_EVERY_S = 24 * 3600
 VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+COMMIT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", re.IGNORECASE)
 
 
 def root() -> Path:
@@ -61,8 +60,9 @@ def show(v: tuple[int, int, int] | None) -> str | None:
 
 
 def _git(*args: str, timeout: float = 20.0) -> subprocess.CompletedProcess:
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-    return subprocess.run(["git", "-C", str(root()), *args], capture_output=True, text=True, timeout=timeout, env=env)
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1"}
+    command = ["git", "-C", str(root()), "-c", f"core.hooksPath={os.devnull}", "-c", "submodule.recurse=false", *args]
+    return subprocess.run(command, capture_output=True, text=True, timeout=timeout, env=env)
 
 
 def current() -> tuple[int, int, int] | None:
@@ -114,7 +114,7 @@ def reminder() -> dict | None:
             return None
         _save(notified=r["latest"])
         return {"latest": r["latest"], "current": r["current"],
-                "line": f"(A Claudia update is ready: v{r['latest']}. Say update when you have a minute.)"}
+                "line": f"(Claudia v{r['latest']} is available. Review its release commit before applying it.)"}
     except Exception:  # noqa: BLE001 - a reminder never breaks the relay
         return None
 
@@ -145,50 +145,10 @@ def _production_state() -> str | None:
         return None
 
 
-def _setup_ok() -> tuple[bool, str]:
-    if os.environ.get("SLOP_UPDATE_SKIP_SETUP") == "1":
-        return True, ""
-    setup = root() / "bin" / "setup.sh"
-    try:
-        r = subprocess.run(["bash", str(setup), "--check", "--json"], capture_output=True, text=True, timeout=180)
-        out = json.loads(r.stdout or "{}")
-        return bool(out.get("ok")) and not out.get("optional"), ""      # a new optional piece (earshot): install it
-    except (OSError, ValueError, subprocess.SubprocessError) as e:
-        return False, str(e)[:200]
-
-
-def _start_install() -> str:
-    log = slop_home() / "update-install.log"
-    log.parent.mkdir(parents=True, exist_ok=True)
-    f = open(log, "ab")                                       # noqa: SIM115 - the detached child owns it
-    subprocess.Popen(["bash", str(root() / "bin" / "setup.sh")], stdout=f, stderr=subprocess.STDOUT,
-                     stdin=subprocess.DEVNULL, start_new_session=True, cwd=str(root()))
-    return str(log)
-
-
-def _refresh_brief() -> dict:
-    """re-run `slop relay setup` with the NEW code (a child process), so the production gets the new brief"""
-    try:
-        from . import relay
-        _, rd = relay._dirs()
-        cfg = json.loads((rd / "config.json").read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001 - no relay yet: nothing to refresh
-        return {"skipped": True}
-    env = {**os.environ, "PYTHONPATH": str(root()) + os.pathsep + os.environ.get("PYTHONPATH", "")}
-    argv = [sys.executable, "-m", "slop", "--json", "relay", "setup", "--engine", cfg.get("engine") or "claude"]
-    if cfg.get("model"):                              # a model the person chose stays
-        argv += ["--model", str(cfg["model"])]
-    r = subprocess.run(argv, capture_output=True, text=True, timeout=180, env=env, cwd=str(root()))
-    try:
-        return {"ok": bool(json.loads(r.stdout).get("ok"))}
-    except ValueError:
-        return {"ok": False, "error": (r.stderr or r.stdout).strip()[-200:]}
-
-
 def cmd_check(a) -> dict:
     r = check(force=a.force)
     if r["newer"]:
-        text = f"Claudia v{r['latest']} is out (this computer has v{r['current']}): say update to get it."
+        text = f"Claudia v{r['latest']} is out (this computer has v{r['current']}). Review its release commit before applying it."
     elif r.get("offline") and not r["latest"]:
         text = f"Claudia v{r['current']} here; the releases could not be read right now (offline?)."
     else:
@@ -204,9 +164,12 @@ def cmd_seen(a) -> dict:
 
 
 def cmd_apply(a) -> dict:
+    reviewed = getattr(a, "commit", None)
+    if not isinstance(reviewed, str) or not COMMIT_RE.fullmatch(reviewed):
+        raise SlopError("provide the independently reviewed, full Git commit ID with --commit")
+    reviewed = reviewed.lower()
     if not a.force and _production_state() == "working":
-        raise SlopError("Opus is working right now; an update would change its tools mid-step. Update after it "
-                        "finishes: say update again then (or `slop update apply --force`)")
+        raise SlopError("Opus is working right now. Apply the reviewed commit after the job finishes.")
     dirty = _git("status", "--porcelain", "--untracked-files=no")
     if dirty.returncode != 0:
         raise SlopError(f"{root()} is not a git checkout of the toolkit: " + dirty.stderr.strip()[-200:])
@@ -219,9 +182,14 @@ def cmd_apply(a) -> dict:
     target = parse(a.to) if a.to else (tags[-1] if tags else None)
     if not target or target not in tags:
         raise SlopError(f"no release v{a.to or '?'}: the releases are " + ", ".join("v" + show(t) for t in tags[-5:]))
-    if before and target == before:
+    selected = _git("rev-parse", "--verify", f"refs/tags/v{show(target)}^{{commit}}")
+    if selected.returncode != 0 or selected.stdout.strip() != reviewed:
+        raise SlopError(f"release v{show(target)} does not resolve to the reviewed commit")
+    head = _git("rev-parse", "--verify", "HEAD^{commit}")
+    if head.returncode == 0 and head.stdout.strip() == reviewed:
         _save(latest=show(max(tags)), notified=show(max(tags)))
-        return {"updated": False, "current": show(before), "text": f"already on v{show(before)}: nothing to update"}
+        return {"updated": False, "current": show(before), "commit": reviewed,
+                "text": f"already on reviewed commit {reviewed}"}
     stashed = None
     if dirty.stdout.strip():                 # a local fix (e.g. one the bot made) is kept in git's stash, not lost
         files = [ln[3:] for ln in dirty.stdout.splitlines()]
@@ -231,7 +199,7 @@ def cmd_apply(a) -> dict:
             raise SlopError(f"the toolkit at {root()} has local changes ({', '.join(files[:5])}) and they could not "
                             "be set aside, so it was not updated: " + (s.stderr or s.stdout).strip()[-200:])
         stashed = files
-    co = _git("checkout", "-q", "v" + show(target))
+    co = _git("checkout", "-q", "--detach", reviewed)
     if co.returncode != 0:
         if stashed:
             _git("stash", "pop")             # back as they were
@@ -240,39 +208,26 @@ def cmd_apply(a) -> dict:
         notes = notes_since((root() / "CHANGELOG.md").read_text(encoding="utf-8"), before)
     except OSError:
         notes = []
-    ok, why = _setup_ok()
-    install_log = None if ok else _start_install()
-    brief = _refresh_brief()
     _save(latest=show(max(tags)), notified=show(max(tags)), checked=util.iso_now(), checked_ts=time.time())
-    recipe = root() / "skills" / "dist" / "recipe.json"
-    nxt = (f"re-apply {recipe} to yourself exactly: your profile, every skill byte for byte, the memory entry; then tell "
-           f"the person 'Updated to v{show(target)}' and these notes")
-    lines = [f"updated: v{show(before)} -> v{show(target)}"]
+    lines = [f"checked out reviewed release v{show(target)} at {reviewed}"]
     if stashed:
-        lines.append(f"local edits set aside ({', '.join(stashed[:5])}); the release has its own version of them. "
-                     f"They are kept: `git -C {root()} stash list`")
-    lines += ["what changed:"] + [f"  {n}" for n in notes] if notes else []
-    if install_log:
-        lines.append(f"installing what the new version needs in the background (a few minutes; log {install_log}); "
-                     "`slop update check` and `bash bin/setup.sh --check --json` show when it is done")
-    if brief.get("ok") is False:
-        lines.append("the production brief was not refreshed: run `slop relay setup` once Opus is signed in")
-    lines.append(f"next: {nxt}")
-    return {"updated": True, "from": show(before), "to": show(target), "notes": notes, "stashed": stashed,
-            "installing": bool(install_log),
-            "brief": brief, "recipe": str(recipe), "next": nxt, "text": "\n".join(lines)}
+        lines.append(f"local edits set aside ({', '.join(stashed[:5])}). They are kept in the Git stash.")
+    if notes:
+        lines.extend(notes)
+    return {"updated": True, "from": show(before), "to": show(target), "commit": reviewed, "notes": notes,
+            "stashed": stashed, "text": "\n".join(lines)}
 
 
 def register(sub) -> None:
-    g = sub.add_parser("update", help="is a newer Claudia release out? update in one step (code, install, brief)")
+    g = sub.add_parser("update", help="check for releases or check out a reviewed release commit")
     us = g.add_subparsers(dest="update_cmd", metavar="ACTION")
     us.required = True
     p = us.add_parser("check", help="this computer's version and the newest release (one network call a day at most)")
     p.add_argument("--force", action="store_true", help="ask the network now, not the cached daily answer")
     p.set_defaults(func=cmd_check)
-    p = us.add_parser("apply", help="fetch the releases, check out the newest, repair the install, refresh the "
-                                    "production brief; prints what changed and the skills step for Grok")
-    p.add_argument("--to", help="a release version (e.g. 0.2.6); default: the newest")
+    p = us.add_parser("apply", help="check out the selected release after verifying its reviewed commit")
+    p.add_argument("--commit", required=True, help="independently reviewed full Git commit ID")
+    p.add_argument("--to", help="a release version (e.g. 0.2.6). Defaults to the latest tag.")
     p.add_argument("--force", action="store_true", help="update even while the production works")
     p.set_defaults(func=cmd_apply)
     p = us.add_parser("seen", help="the reminder for the newest release was shown (it is not shown again)")

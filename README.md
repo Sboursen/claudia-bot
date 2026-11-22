@@ -346,7 +346,7 @@ or after the command name; the documented form is `slop --json --project NAME <c
 | Command | What it does |
 |---|---|
 | `slop update check [--force]` | this computer's version and the newest release (one network call a day at most) |
-| `slop update apply [--to TO] [--force]` | fetch the releases, check out the newest, repair the install, refresh the production brief; prints what changed and the skills step for Grok |
+| `slop update apply --commit COMMIT [--to TO] [--force]` | check out the selected release after verifying its reviewed commit |
 | `slop update seen` | the reminder for the newest release was shown (it is not shown again) |
 
 ### Home GPU
@@ -370,6 +370,9 @@ or after the command name; the documented form is `slop --json --project NAME <c
 | `slop gpu direct-ingest JOB [--from SRC]` | direct mode: finish JOB from the output parts copied back with CopyToBox |
 
 <!-- END MODULE COMMANDS -->
+
+Supply the full commit ID from an independent release review when applying an update. Set `--to` to the
+reviewed version to select an older release. Provision approved dependencies separately before using the new checkout.
 
 ## Layout
 
