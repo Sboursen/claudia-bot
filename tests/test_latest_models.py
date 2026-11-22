@@ -109,14 +109,14 @@ def test_new_projects_pin_nothing_and_ask_the_switches(tmp_path, monkeypatch):
     assert rc == 1 and "true or false" in out["error"]
     assert K.run("relay", "setup")[0] == 0
     rc, out = K.run("-p", "demo", "relay", "job", "--kind", "midjourney", "--text", "a door --ar 16:9 --raw --v 8.2")
-    assert rc == 0 and "Personalization: off" in out["text"] and "dropped --raw" in out["text"], out
+    assert rc == 0 and not out["dispatch_enabled"] and "dropped --raw" in " ".join(out["adjusted"]), out
     rc, out = K.run("-p", "demo", "relay", "job", "--kind", "midjourney", "--personalize", "on", "--text", "a door")
-    assert rc == 0 and "P button" in out["text"], out
+    assert rc == 0 and not out["dispatch_enabled"], out
     rc, r = K.run("relay", "read")
     mj = [j for j in r["jobs"] if j["job_kind"] == "midjourney"]
     assert [j["text"] for j in mj] == [["a door --ar 16:9"], ["a door"]]
     assert [j["personalize"] for j in mj] == [False, True]
-    assert "the P button off" in r["grok_next"] and "the P button on" in r["grok_next"]
+    assert not r["dispatch_enabled"] and "Automatic job dispatch is disabled" in r["grok_next"]
 
 
 def test_opus_and_grok_are_told_to_use_the_newest():

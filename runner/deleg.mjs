@@ -26,7 +26,7 @@
  *   node deleg.mjs templates | doctor [--render] | selftest [--keep] | preflight <engine> [--workflow] [--dir D] [--job D]
  *   node deleg.mjs version | help
  *   GATES (only when the job.json asks for them; the approval card then shows them): --allow-api-billing
- *                          --allow-spend  --allow-raw  --pass-env NAME[,NAME]
+ *                          --allow-spend  --allow-network  --allow-raw  --pass-env NAME[,NAME]
  *
  * Every command prints ONE JSON line ({"ok":true,...} or {"ok":false,"error":...,"fix":...}); `wait` and `run` print
  * compact progress lines and always end with "STATUS {json}". Exit code 0 = ok/done/running, 1 = error/failed/stopped/lost.
@@ -95,6 +95,7 @@ import { fileURLToPath } from 'node:url';
 
 const VERSION = '1.1.0';
 const WIN = process.platform === 'win32';
+const WINDOWS_DEVICE = /^(?:con|conin\$|conout\$|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/i;
 const HOME = os.homedir();
 const SELF = fileURLToPath(import.meta.url);
 const RUNNER_DIR = path.dirname(SELF);
@@ -170,7 +171,7 @@ function writeJSON(f, obj) {   // atomic: tmp + rename, retried (Windows refuses
 function alive(pid) { if (!pid) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } }
 function warn(st, msg) { const w = (st.warnings ||= []); if (!w.includes(msg) && w.length < 40) w.push(msg); }
 function parseArgs(argv, verb) {
-  const BOOL = new Set(['force', 'allow-api-billing', 'allow-spend', 'allow-raw', 'fresh', 'keep', 'json', 'help', 'check', 'render']);
+  const BOOL = new Set(['force', 'allow-api-billing', 'allow-spend', 'allow-network', 'allow-raw', 'fresh', 'keep', 'json', 'help', 'check', 'render']);
   if (verb === 'preflight') BOOL.add('workflow');   // `new --workflow W` takes a value; `preflight --workflow` is a switch
   const pos = [], opt = { set: [], 'pass-env': [] };
   for (let i = 0; i < argv.length; i++) {
@@ -190,6 +191,7 @@ function parseArgs(argv, verb) {
 // The gates the command line grants (see the header): what the user saw on the approval card.
 function grantsFrom(opt) {
   return { allow_api_billing: !!opt['allow-api-billing'], allow_spend: !!opt['allow-spend'], allow_raw: !!opt['allow-raw'],
+    allow_network: [true, 'true'].includes(opt['allow-network']),
     pass_env: [...new Set(opt['pass-env'] || [])] };
 }
 function slug(s) { return String(s || 'job').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'job'; }
@@ -224,57 +226,132 @@ function jobPaths(jobdir) {
     outbox: path.join(J, 'outbox'), wf: path.join(J, 'wf'), runs: path.join(J, 'runs'), stop: path.join(J, '.stop'),
     runsMd: path.join(J, 'RUNS.md') };
 }
+function nextAttempt(st) {
+  return Number.isSafeInteger(st.attempt) && st.attempt >= 0 && st.attempt < Number.MAX_SAFE_INTEGER ? st.attempt + 1 : 1;
+}
+function jobLocalFile(J, name) {
+  const file = path.resolve(J, name);
+  const relative = path.relative(J, file);
+  const parts = relative.split(path.sep);
+  const badWindowsPath = WIN && ((path.parse(name).root && !path.isAbsolute(name)) ||
+    parts.some(part => /[:<>"|?*]|[ .]$/.test(part) || WINDOWS_DEVICE.test(part)));
+  if (!relative || parts[0] === '..' || path.isAbsolute(relative) || name.includes('\0') || badWindowsPath ||
+      (!WIN && name.includes('\\'))) {
+    throw new UserError('the prompt must be a file inside the job folder', 'Set "prompt_file" to a job-local path.');
+  }
+  let current = J;
+  for (const part of parts) {
+    const directory = fs.lstatSync(current, { throwIfNoEntry: false });
+    if (directory && !directory.isDirectory()) {
+      throw new UserError('a job file path uses a linked or non-directory parent', 'Use real directories in the job folder.');
+    }
+    current = path.join(current, part);
+  }
+  const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (stat && (!stat.isFile() || stat.nlink !== 1)) {
+    throw new UserError('a job file must be a regular file with no links', 'Copy the file into the job folder.');
+  }
+  return { file, stat };
+}
+function readJobPrompt(J, name) {
+  const { file, stat } = jobLocalFile(J, name);
+  if (!stat) return null;
+  const { O_RDONLY, O_NOFOLLOW = 0, O_NONBLOCK = 0 } = fs.constants;
+  const fd = fs.openSync(file, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+  try {
+    const opened = fs.fstatSync(fd);
+    const current = jobLocalFile(J, name).stat;
+    if (!current || !opened.isFile() || opened.nlink !== 1 || opened.dev !== current.dev || opened.ino !== current.ino) {
+      throw new UserError('the job prompt changed while opening it', 'Retry with a stable file inside the job folder.');
+    }
+    return fs.readFileSync(fd, 'utf8');
+  } finally { fs.closeSync(fd); }
+}
+function writeJobPrompt(J, name, text) {
+  const { file } = jobLocalFile(J, name);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const { stat } = jobLocalFile(J, name);
+  const tmp = path.join(path.dirname(file), `.prompt-${crypto.randomBytes(12).toString('hex')}.tmp`);
+  const fd = fs.openSync(tmp, 'wx', stat ? stat.mode & 0o777 : 0o600);
+  try {
+    try { fs.writeFileSync(fd, text); } finally { fs.closeSync(fd); }
+    jobLocalFile(J, name);
+    fs.renameSync(tmp, file);
+  } finally { try { fs.unlinkSync(tmp); } catch {} }
+  return file;
+}
 // Move an earlier run's files into <job>/history/<n>/ so the folder can run a new job.json from scratch.
 const RUN_FILES = /^(status\.json|progress\.log|raw-\d+\.jsonl|stderr-\d+\.log|prompt-\d+\.md|resume-\d+\.md|outbox|outbox\.tgz(\.\d{3})?|runs|RUNS\.md|wf|\.cursor-\w+|\.stop|last-message\.txt|BRIEF\.md)$/;
-function archiveRun(J) {
+function archiveRun(J, promptName = null) {
   const H = path.join(J, 'history'); let n = 1;
-  while (fs.existsSync(path.join(H, String(n)))) n++;
-  const dest = path.join(H, String(n)); let moved = 0;
-  for (const f of fs.readdirSync(J)) {
-    if (!RUN_FILES.test(f)) continue;
-    fs.mkdirSync(dest, { recursive: true });
-    fs.renameSync(path.join(J, f), path.join(dest, f)); moved++;
+  const history = fs.lstatSync(H, { throwIfNoEntry: false });
+  if (history && !history.isDirectory()) throw new UserError('the job history path is not a real directory', 'Move it aside before replacing the job.');
+  while (fs.lstatSync(path.join(H, String(n)), { throwIfNoEntry: false })) n++;
+  const dest = path.join(H, String(n));
+  const files = fs.readdirSync(J).filter(f => RUN_FILES.test(f));
+  if (promptName) {
+    const { file, stat } = jobLocalFile(J, promptName);
+    const relative = path.relative(J, file);
+    if (stat && !files.includes(relative.split(path.sep)[0])) files.push(relative);
   }
-  return moved ? fwd(dest) : null;
+  for (const f of files) {
+    const archiveFile = path.join(dest, f);
+    fs.mkdirSync(path.dirname(archiveFile), { recursive: true });
+    fs.renameSync(path.join(J, f), archiveFile);
+  }
+  return files.length ? fwd(dest) : null;
 }
 // A job can arrive as ONE file copied next to the jobs ("<jobs>/<id>.job.json", one CopyFromBox into an existing folder):
 // it is adopted into "<jobs>/<id>/job.json" (the brief is embedded in it; the runner rebuilds BRIEF.md and wf/). A file
 // copied anywhere else (e.g. the home folder) goes to <projects>/<project_name>/jobs/<id>/ when that project exists here.
-function adoptJobFile(arg) {
+function adoptJobFile(arg, grants) {
   const f = path.resolve(String(arg));
-  let st; try { st = fs.statSync(f); } catch { return arg; }
-  if (!st.isFile() || !/\.json$/i.test(f)) return arg;
+  const st = fs.lstatSync(f, { throwIfNoEntry: false });
+  if (!st || !/\.json$/i.test(f) || st.isDirectory()) return arg;
+  if (!st.isFile() || st.nlink !== 1) throw new UserError('the imported job must be a regular JSON file with no links', 'Copy the job JSON as a regular file.');
   if (path.basename(f) === 'job.json') return path.dirname(f);
   const job = readJSONStrict(f, 'job file');
-  const id = job.id && /^[\w.-]+$/.test(job.id) ? job.id : slug(path.basename(f).replace(/(\.job)?\.json$/i, ''));
+  validateJob(job, { job: f });
+  const localName = value => typeof value === 'string' && /^[\w.-]+$/.test(value) && value !== '.' && value !== '..' &&
+    (!WIN || (!value.endsWith('.') && !WINDOWS_DEVICE.test(value)));
+  const id = localName(job.id) ? job.id : slug(path.basename(f).replace(/(\.job)?\.json$/i, ''));
   let jobsDir = path.dirname(f);
   const inProject = path.basename(jobsDir) === 'jobs' && fs.existsSync(path.join(jobsDir, '..', 'project.json'));
-  if (!inProject && job.project_name && /^[\w.-]+$/.test(job.project_name)) {
+  if (!inProject && localName(job.project_name)) {
     const pj = path.join(projectsRoot(), job.project_name);
-    if (fs.existsSync(path.join(pj, 'project.json'))) jobsDir = path.join(pj, 'jobs');
+    if (fs.lstatSync(pj, { throwIfNoEntry: false })?.isDirectory() && fs.existsSync(path.join(pj, 'project.json'))) {
+      const candidate = path.join(pj, 'jobs');
+      const selected = fs.lstatSync(candidate, { throwIfNoEntry: false });
+      if (selected && !selected.isDirectory()) throw new UserError('the project jobs path is not a real directory', 'Copy the job to a regular jobs folder.');
+      jobsDir = candidate;
+    }
   }
   const J = path.join(jobsDir, id);
   const p = jobPaths(J);
-  if (fs.existsSync(p.job)) {
-    if (readText(p.job) === readText(f)) return J;
-    if (fs.existsSync(p.status)) {   // a DIFFERENT job.json with the same id (e.g. `new --force` on the box): a new run
-      const old = effectiveStatus(p);
-      if (ACTIVE.has(old.state) || old.state === 'lost')
-        throw new UserError(`job ${id} is ${old.state} in ${fwd(J)} and a different job.json with the same id arrived`,
-          old.state === 'lost' ? `Resume or finish the old run first (node deleg.mjs resume "${fwd(J)}"), or give the new job another id.` : `Wait for it to end, or stop it (node deleg.mjs stop "${fwd(J)}"), then run the new file again.`);
-      archiveRun(J);
-    }
+  const existing = jobLocalFile(J, 'job.json').stat;
+  const previous = existing ? readJSON(p.job) : null;
+  if (JSON.stringify(previous) === JSON.stringify(job)) return J;
+  const { promptName } = authorizeJob(p, grants, { job });
+  if (existing && fs.existsSync(p.status)) {   // a DIFFERENT job.json with the same id: a new run
+    const old = effectiveStatus(p);
+    if (ACTIVE.has(old.state) || old.state === 'lost')
+      throw new UserError(`job ${id} is ${old.state} in ${fwd(J)} and a different job.json with the same id arrived`,
+        old.state === 'lost' ? `Resume or finish the old run first (node deleg.mjs resume "${fwd(J)}"), or give the new job another id.` : `Wait for it to end, or stop it (node deleg.mjs stop "${fwd(J)}"), then run the new file again.`);
+    const oldPrompt = previous?.prompt_file ?? 'BRIEF.md';
+    const replacePrompt = promptName && typeof oldPrompt === 'string' && typeof job.brief === 'string' && job.brief.trim() &&
+      path.relative(path.resolve(J, oldPrompt), path.resolve(J, promptName)) === '';
+    archiveRun(J, replacePrompt ? promptName : null);
   }
   fs.mkdirSync(J, { recursive: true });
-  fs.copyFileSync(f, p.job);
-  if (!fs.existsSync(p.status) && typeof job.brief === 'string' && job.brief.trim()) { try { fs.rmSync(path.join(J, path.basename(String(job.prompt_file || 'BRIEF.md'))), { force: true }); } catch {} }   // rebuild from the new job.json
+  jobLocalFile(J, 'job.json');
+  writeJSON(p.job, job);
   return J;
 }
-function requireJobDir(arg, verb) {
+function requireJobDir(arg, verb, grants) {
   if (!arg) throw new UserError(`${verb} needs a job folder`, `node deleg.mjs ${verb} <jobdir>   (the folder that holds job.json, or a copied <id>.job.json file)`);
-  if (['run', 'start', 'status', 'wait'].includes(verb)) arg = adoptJobFile(arg);
+  if (['run', 'start', 'status', 'wait'].includes(verb)) arg = adoptJobFile(arg, grants);
   const p = jobPaths(arg);
-  if (!fs.existsSync(p.job)) throw new UserError(`no job.json in ${fwd(p.J)}`, 'Create the job first: node deleg.mjs new <jobdir> --brief <name> (see: node deleg.mjs templates)');
+  if (!jobLocalFile(p.J, 'job.json').stat) throw new UserError(`no job.json in ${fwd(p.J)}`, 'Create the job first: node deleg.mjs new <jobdir> --brief <name> (see: node deleg.mjs templates)');
   return p;
 }
 function validateJob(job, p) {
@@ -291,11 +368,13 @@ function validateJob(job, p) {
   for (const k of ['workflow_args', 'env', 'vars'])
     if (job[k] != null && (typeof job[k] !== 'object' || Array.isArray(job[k]))) errs.push(`"${k}" must be an object`);
   if (job.sandbox && !['read-only', 'workspace-write', 'danger-full-access'].includes(job.sandbox)) errs.push('"sandbox" must be read-only|workspace-write|danger-full-access');
+  if (job.network != null && typeof job.network !== 'boolean') errs.push('"network" must be a boolean');
+  if (job.prompt_file != null && (typeof job.prompt_file !== 'string' || !job.prompt_file.trim())) errs.push('"prompt_file" must be a non-empty path');
   if (job.engine_bin != null && !(typeof job.engine_bin === 'string' || (Array.isArray(job.engine_bin) && job.engine_bin.length))) errs.push('"engine_bin" must be a path or a non-empty list');
   if (errs.length) throw new UserError(`job.json is invalid: ${errs.join('; ')}`, `Edit ${fwd(p.job)} (fields: runner/README.md, "job.json").`);
   return Object.keys(job).filter(k => !JOB_KEYS.has(k));
 }
-function loadJob(p) { const job = readJSONStrict(p.job, 'job.json'); const unknown = validateJob(job, p); return { job, unknown }; }
+function loadJob(p) { const job = readJSONStrict(jobLocalFile(p.J, 'job.json').file, 'job.json'); const unknown = validateJob(job, p); return { job, unknown }; }
 function resolveProjectDir(job, J) {
   const guess = path.resolve(J, '..', '..');
   const guessOk = fs.existsSync(path.join(guess, 'project.json'));
@@ -696,6 +775,7 @@ function elevations(job, ctx = {}) {
   const out = [];
   if (job.allow_api_billing) out.push({ field: 'allow_api_billing', flag: '--allow-api-billing', detail: 'keeps API-key variables, so the engine may bill an API key instead of the subscription' });
   if (job.allow_spend) out.push({ field: 'allow_spend', flag: '--allow-spend', detail: "enables Claude's Higgsfield connector, which spends credits" });
+  if (job.engine === 'codex' && job.network === true) out.push({ field: 'allow_network', flag: '--allow-network', detail: 'enables outbound network access in the Codex workspace sandbox' });
   for (const k of job.pass_env || []) out.push({ field: 'pass_env', name: String(k), flag: `--pass-env ${k}`, detail: `hands the secret ${k} to the engine` });
   const raw = [];
   if (job.engine === 'raw') raw.push('engine "raw" (runs argv as a command)'); else if (job.argv) raw.push('argv');
@@ -718,27 +798,32 @@ function elevations(job, ctx = {}) {
 function gateFlags(job, ctx) { return [...new Set(elevations(job, ctx).map(e => e.flag))]; }
 function checkGates(job, grants, ctx) {
   const g = grants || {};
-  const missing = elevations(job, ctx).filter(e => e.field === 'pass_env' ? !(g.pass_env || []).includes(e.name) : !g[e.field === 'raw' ? 'allow_raw' : e.field]);
+  const missing = elevations(job, ctx).filter(e => e.field === 'pass_env' ? !(g.pass_env || []).includes(e.name) : g[e.field === 'raw' ? 'allow_raw' : e.field] !== true);
   if (missing.length) throw new UserError(`this job.json asks for more than the safe defaults and the command line does not grant it: ${missing.map(m => `${m.field}: ${m.detail}`).join('; ')}`,
     `Ask the user first. Only if they agree, run the same command again with ${[...new Set(missing.map(m => m.flag))].join(' ')} added (the approval card then shows it). Otherwise rebuild the job without those fields.`);
 }
 function gatesLine(job, grants) {
   const g = grants || {};
-  return `gates: api-billing ${g.allow_api_billing ? 'ON' : 'off'}, spend ${job.allow_spend && g.allow_spend ? 'ON' : 'off'}, raw ${g.allow_raw ? 'ON' : 'off'}, pass-env ${(job.pass_env || []).join(',') || '-'}`;
+  return `gates: api-billing ${g.allow_api_billing ? 'ON' : 'off'}, spend ${job.allow_spend && g.allow_spend ? 'ON' : 'off'}, network ${job.engine === 'codex' && job.network === true && g.allow_network === true ? 'ON' : 'off'}, raw ${g.allow_raw ? 'ON' : 'off'}, pass-env ${(job.pass_env || []).join(',') || '-'}`;
 }
 
 // ------------------------------------------------------------------------------------------------------------ materialize
-// Make a job folder runnable on THIS machine: BRIEF.md from job.brief, wf/<name>.js from the toolkit, runtime tokens.
-function materialize(p) {
-  const { job, unknown } = loadJob(p);
+function authorizeJob(p, grants, { job, unknown } = loadJob(p)) {
+  const P = resolveProjectDir(job, p.J);
+  checkGates(job, grants, { J: p.J, P, cwd: job.cwd ? path.resolve(p.J, job.cwd) : null });
+  const promptName = job.engine === 'raw' ? null : (job.prompt_file ?? 'BRIEF.md');
+  if (promptName) jobLocalFile(p.J, promptName);
+  return { job, unknown, P, promptName };
+}
+// Make an authorized job runnable on THIS machine: prompt, wf/<name>.js from the toolkit, runtime tokens.
+function materialize(p, { job, unknown, P, promptName }) {
   const J = p.J;
-  fs.mkdirSync(p.outbox, { recursive: true });
-  const P = resolveProjectDir(job, J);
-  const promptFile = path.resolve(J, job.prompt_file || 'BRIEF.md');
-  if (job.engine !== 'raw' && !fs.existsSync(promptFile)) {
-    if (typeof job.brief === 'string' && job.brief.trim()) fs.writeFileSync(promptFile, job.brief);
-    else throw new UserError(`no ${path.basename(promptFile)} in the job folder and no "brief" text in job.json`, 'Create the job with: node deleg.mjs new <jobdir> --brief <name>');
+  const stored = promptName ? readJobPrompt(J, promptName) : null;
+  const source = stored ?? job.brief;
+  if (promptName && stored == null && (typeof source !== 'string' || !source.trim())) {
+    throw new UserError(`no ${path.basename(promptName)} in the job folder and no "brief" text in job.json`, 'Create the job with: node deleg.mjs new <jobdir> --brief <name>');
   }
+  fs.mkdirSync(p.outbox, { recursive: true });
   let wfPath = null;
   if (job.workflow) {
     wfPath = path.join(p.wf, path.basename(String(job.workflow)).replace(/\.js$/, '') + '.js');
@@ -761,19 +846,20 @@ function materialize(p) {
     writeJSON(path.join(p.wf, 'args.json'), args);
   }
   tokens.WORKFLOW_ARGS = args ? JSON.stringify(args) : '{}';
-  if (job.engine !== 'raw') {
-    const t = fs.readFileSync(promptFile, 'utf8');
-    const { text, missing } = fill(t, tokens);
-    if (missing.length) throw new UserError(`${path.basename(promptFile)} has unfilled placeholders: ${missing.map(m => `{{${m}}}`).join(', ')}`,
+  let promptText = null;
+  if (promptName) {
+    const { text, missing } = fill(source, tokens);
+    if (missing.length) throw new UserError(`${path.basename(promptName)} has unfilled placeholders: ${missing.map(m => `{{${m}}}`).join(', ')}`,
       `Re-create the job: node deleg.mjs new <jobdir> --brief <name> --set ${missing[0]}=... --force (or edit the file by hand).`);
-    if (text !== t) fs.writeFileSync(promptFile, text);
+    if (text !== stored) writeJobPrompt(J, promptName, text);
+    promptText = text;
   }
-  return { job, unknown, P, wfPath, args, slop, promptFile, wired };
+  return { job, unknown, P, wfPath, args, slop, promptText, wired };
 }
 
 // ---------------------------------------------------------------------------------------------------- argv & env builders
 function buildArgv(job, ctx) {
-  const { J, st, promptFile, cwd, addDirs, allowBilling } = ctx;
+  const { J, st, promptFile, promptText, cwd, addDirs, allowBilling, allowNetwork } = ctx;
   const outbox = path.join(J, 'outbox');
   const add = (a, flag, v) => { if (v !== undefined && v !== null && v !== '') a.push(flag, String(v)); };
   if (job.engine === 'claude') {
@@ -793,22 +879,21 @@ function buildArgv(job, ctx) {
     return { argv: a, stdin: null };
   }
   if (job.engine === 'codex') {
-    const prompt = fs.readFileSync(promptFile, 'utf8');
     const common = ['--json', '--skip-git-repo-check'];
     if (!allowBilling) common.push('-c', 'forced_login_method="chatgpt"');
     common.push('-o', path.join(J, 'last-message.txt'));
     if (job.model) common.push('-m', String(job.model));
     if (job.effort) common.push('-c', `model_reasoning_effort="${job.effort}"`);
     if (job.output_schema) common.push('--output-schema', path.resolve(J, job.output_schema));
-    if (job.network) common.push('-c', 'sandbox_workspace_write.network_access=true');
     for (const c of job.codex_config || []) common.push('-c', String(c));
+    common.push('-c', `sandbox_workspace_write.network_access=${job.network === true && allowNetwork === true}`);
     const sandbox = job.sandbox || 'workspace-write';
     // `exec resume` has no -s/--sandbox/-C/--add-dir: pass the sandbox with -c and rely on the cwd.
-    if (st.thread_id) return { argv: ['exec', 'resume', ...common, '-c', `sandbox_mode="${sandbox}"`, st.thread_id, '-'], stdin: prompt };
+    if (st.thread_id) return { argv: ['exec', 'resume', ...common, '-c', `sandbox_mode="${sandbox}"`, st.thread_id, '-'], stdin: promptText };
     const a = ['exec', ...common, '-C', cwd, '-s', sandbox];
     for (const d of addDirs) a.push('--add-dir', d);
     a.push('-');   // prompt on stdin; the supervisor closes stdin (Codex reads a non-TTY stdin and would wait)
-    return { argv: a, stdin: prompt };
+    return { argv: a, stdin: promptText };
   }
   if (job.engine === 'muse') {
     const a = ['exec', '--json', '--prompt-file', promptFile, '--approval-mode', job.approval_mode || 'never', '--workspace', cwd,
@@ -1143,11 +1228,10 @@ function countRunning(root, self) {
   }
   return n;
 }
-async function supervise(jobdir) {
+async function supervise(jobdir, pending) {
   const p = jobPaths(jobdir);
   let st = readJSON(p.status, {}) || {};
-  const pending = st.pending || {};
-  const attempt = (st.attempt || 0) + 1;
+  const attempt = nextAttempt(st);
   const progLine = line => {
     const l = String(line).replace(/\s+/g, ' ').slice(0, 240);
     fs.appendFileSync(p.progress, `${now()} ${l}\n`);
@@ -1172,8 +1256,7 @@ async function supervise(jobdir) {
   };
   let ctx;
   try {
-    ctx = materialize(p);
-    checkGates(ctx.job, grants, { J: p.J, P: ctx.P, cwd: ctx.job.cwd ? path.resolve(p.J, ctx.job.cwd) : null });   // job.json may have changed since `start`
+    ctx = materialize(p, authorizeJob(p, grants));   // job.json may have changed since `start`
   } catch (e) { failEarly(e); return; }
   const { job } = ctx;
   st.engine = job.engine; st.kind = job.kind || null; st.gates = gatesLine(job, grants);
@@ -1271,6 +1354,7 @@ function releaseGroup(root, group, J) {
 async function superviseRun(p, st, ctx, pending, attempt, progLine, failEarly, grants) {
   const { job, P, slop } = ctx;
   const allowBilling = !!grants.allow_api_billing;
+  const allowNetwork = grants.allow_network === true;
   // the toolkit runtime the brief's checks need, proven on THIS machine before the engine starts
   const req = new Set(job.requires || []);
   if (req.size) {
@@ -1280,15 +1364,21 @@ async function superviseRun(p, st, ctx, pending, attempt, progLine, failEarly, g
   }
 
   // prompt for this attempt: a short preface + the brief (or the resume prompt)
-  const resumeFile = pending.resume_prompt ? path.resolve(p.J, pending.resume_prompt) : null;
-  const body = fs.readFileSync(resumeFile || ctx.promptFile, 'utf8');
+  const resumeName = pending.resume_prompt;
   const preface = job.engine === 'raw' ? '' : [
     `You are a delegated ${job.engine} session running unattended on the user's own computer for the Claudia music-video toolkit. Nobody answers questions mid-run: make sensible calls, write them down, and finish.`,
     `Job folder: ${fwd(p.J)}. Project folder: ${P ? fwd(P) : '(none)'}. Deliverables go exactly where the brief says (some briefs write project files, e.g. board/ or engine/ch/, which the runner collects); everything else you write (reports, notes, results) goes in ${fwd(p.outbox)}. Write continuously, so a cut at any moment leaves valid files.`,
-    attempt > 1 ? (resumeFile ? `This is attempt ${attempt}: a continuation of an earlier attempt of this job.` : `This is attempt ${attempt} of this job: an earlier session ended. Read ${fwd(path.join(p.outbox, 'handoff.md'))} and ${fwd(path.join(p.outbox, 'report.md'))} first if they exist, and continue; do not redo finished work.`) : '',
+    attempt > 1 ? (resumeName ? `This is attempt ${attempt}: a continuation of an earlier attempt of this job.` : `This is attempt ${attempt} of this job: an earlier session ended. Read ${fwd(path.join(p.outbox, 'handoff.md'))} and ${fwd(path.join(p.outbox, 'report.md'))} first if they exist, and continue; do not redo finished work.`) : '',
   ].filter(Boolean).join('\n') + '\n\n';
-  const promptFile = path.join(p.J, `prompt-${attempt}.md`);
-  if (job.engine !== 'raw') fs.writeFileSync(promptFile, preface + body);
+  let promptFile = null, promptText = null;
+  try {
+    if (job.engine !== 'raw') {
+      const body = resumeName ? readJobPrompt(p.J, resumeName) : ctx.promptText;
+      if (body == null) throw new UserError('the continuation prompt is missing', 'Run resume again with a job-local copy of the prompt.');
+      promptText = preface + body;
+      promptFile = writeJobPrompt(p.J, `prompt-${attempt}.md`, promptText);
+    }
+  } catch (e) { failEarly(e); return; }
   if (!st.session_id && !st.thread_id) st.planned_session_id = crypto.randomUUID();
   const cwd = job.cwd ? path.resolve(p.J, job.cwd) : (P || p.J);
   const addDirs = [...new Set([p.J, ...(P && path.resolve(P) !== path.resolve(cwd) ? [P] : []), TOOLKIT_DIR, ...(job.add_dirs || []).map(d => path.resolve(p.J, d))])].map(fwd);
@@ -1296,7 +1386,7 @@ async function superviseRun(p, st, ctx, pending, attempt, progLine, failEarly, g
   let eng, b;
   try {
     eng = resolveEngine(job);
-    b = buildArgv(job, { J: p.J, st, promptFile, cwd, addDirs, allowBilling });
+    b = buildArgv(job, { J: p.J, st, promptFile, promptText, cwd, addDirs, allowBilling, allowNetwork });
   } catch (e) { failEarly(e); return; }
   const cmd = b.cmd || eng.cmd, argv = [...eng.pre, ...b.argv];
   const { env, stripped } = buildEnv(job, { J: p.J, P, slop, allowBilling });
@@ -1312,7 +1402,7 @@ async function superviseRun(p, st, ctx, pending, attempt, progLine, failEarly, g
   if (spawnErr) exit = { code: -1 };
   else {
     st.engine_pid = child.pid || null; writeJSON(p.status, st);
-    if (child.pid) progLine(`start attempt ${attempt} ${job.engine} pid ${child.pid}${resumeFile ? ' (resume)' : ''}${stripped.length ? ` env stripped: ${stripped.join(',')}` : ''}`);
+    if (child.pid) progLine(`start attempt ${attempt} ${job.engine} pid ${child.pid}${resumeName ? ' (resume)' : ''}${stripped.length ? ` env stripped: ${stripped.join(',')}` : ''}`);
     if (b.stdin != null) { child.stdin.on('error', () => {}); child.stdin.end(b.stdin); }
     let buf = '', lastFlush = 0, killing = null;
     const dec = new StringDecoder('utf8');
@@ -1388,8 +1478,9 @@ function appendRuns(p, st, job, ctx, state) {
 }
 
 // ------------------------------------------------------------------------------------------------------------ launching
-function launch(J) {   // double spawn: the supervisor is orphaned from the calling shell's process tree
-  const c = spawn(process.execPath, [SELF, '_launch2', J], { detached: true, stdio: 'ignore', windowsHide: true });
+function launch(J, pending) {   // double spawn: the supervisor is orphaned from the calling shell's process tree
+  // Grants come from this invocation, through argv, so a job cannot supply them through status.json.
+  const c = spawn(process.execPath, [SELF, '_launch2', J, JSON.stringify(pending)], { detached: true, stdio: 'ignore', windowsHide: true });
   c.unref();
 }
 function startJob(p, opt = {}) {
@@ -1400,14 +1491,14 @@ function startJob(p, opt = {}) {
       st.state === 'done' ? 'Nothing to do. To run it again from scratch: start --fresh. To continue the same session with new instructions: resume <jobdir> <prompt-file>.'
         : 'resume <jobdir> continues the same session (keeps finished work); start --fresh starts over.');
   }
-  const m = materialize(p);
   const grants = opt.grants || {};
-  checkGates(m.job, grants, { J: p.J, P: m.P, cwd: m.job.cwd ? path.resolve(p.J, m.job.cwd) : null });   // refuse in the foreground
-  resolveEngine(m.job);   // fail now, in the foreground, if the engine is missing
+  const authorized = authorizeJob(p, grants);   // refuse in the foreground
+  resolveEngine(authorized.job);   // fail now, in the foreground, if the engine is missing
+  const m = materialize(p, authorized);
   try { fs.unlinkSync(p.stop); } catch {}
   const pending = { grants, fresh: !!opt.fresh, resume_prompt: opt.resume || null };
-  writeJSON(p.status, { ...st, state: 'starting', engine: m.job.engine, queued_at: now(), updated: now(), error: null, pending });
-  launch(p.J);
+  writeJSON(p.status, { ...st, state: 'starting', engine: m.job.engine, queued_at: now(), updated: now(), error: null, pending: undefined });
+  launch(p.J, pending);
   return { already: false, job: m.job, unknown: m.unknown, wired: m.wired };
 }
 
@@ -1519,6 +1610,7 @@ function cmdNew(pos, opt) {
   }
   validateJob(job, jobPaths(J));
   const p = jobPaths(J);
+  jobLocalFile(J, job.prompt_file ?? 'BRIEF.md');
   const flags = gateFlags(job, { J, P });
   const id = path.basename(J);
   const userCmd = `node "<TK>/runner/deleg.mjs" run "<PROJ>/jobs/${id}.job.json"${flags.length ? ' ' + flags.join(' ') : ''}`;
@@ -1538,7 +1630,7 @@ function cmdNew(pos, opt) {
   }
   const archived = fs.existsSync(J) ? archiveRun(J) : null;   // --force: a clean folder (status, progress, outbox … go to history/N/)
   fs.mkdirSync(p.outbox, { recursive: true });
-  fs.writeFileSync(path.join(J, 'BRIEF.md'), text);
+  writeJobPrompt(J, job.prompt_file ?? 'BRIEF.md', text);
   if (workflow) { fs.mkdirSync(p.wf, { recursive: true }); fs.copyFileSync(resolveWorkflow(workflow), path.join(p.wf, path.basename(String(workflow)).replace(/\.js$/, '') + '.js')); }
   writeJSON(p.job, job);
   return { ok: true, job_dir: fwd(J), job_json: fwd(p.job), brief: meta.name, engine, engine_from: engineFrom, ...(engineNote ? { engine_note: engineNote } : {}),
@@ -1586,11 +1678,12 @@ async function cmdWait(pos) {
 async function cmdRun(pos, opt) {
   let p = null;
   try {
-    p = requireJobDir(pos[0], 'run');
+    const grants = grantsFrom(opt);
+    p = requireJobDir(pos[0], 'run', grants);
     const st0 = effectiveStatus(p);
     if (TERMINAL.has(st0.state)) { process.stdout.write(`${now()} job already ${st0.state}; not starting it again (resume or start --fresh to run more)\nSTATUS ${JSON.stringify(summary(p, st0))}\n`); return st0.state === 'done' ? 0 : 1; }
     if (st0.state === 'lost') { process.stdout.write(`STATUS ${JSON.stringify(summary(p, st0))}\n`); return 1; }
-    if (!ACTIVE.has(st0.state)) { const r = startJob(p, { grants: grantsFrom(opt) }); process.stdout.write(`${now()} started ${r.job.engine} job ${path.basename(p.J)}${r.wired ? ` (${r.wired.text})` : ''}\n`); }
+    if (!ACTIVE.has(st0.state)) { const r = startJob(p, { grants }); process.stdout.write(`${now()} started ${r.job.engine} job ${path.basename(p.J)}${r.wired ? ` (${r.wired.text})` : ''}\n`); }
     else process.stdout.write(`${now()} re-attached to running job ${path.basename(p.J)}\n`);
   } catch (e) { if (e instanceof UserError) return statusError(p, e); throw e; }
   const onSig = () => { process.stdout.write(`${now()} follower detached; the job keeps running (status/wait/run to check)\n`); process.exit(0); };
@@ -1601,8 +1694,9 @@ async function cmdRun(pos, opt) {
   return st.state === 'done' ? 0 : 1;
 }
 function cmdStart(pos, opt) {
-  const p = requireJobDir(pos[0], 'start');
-  const r = startJob(p, { grants: grantsFrom(opt), fresh: !!opt.fresh });
+  const grants = grantsFrom(opt);
+  const p = requireJobDir(pos[0], 'start', grants);
+  const r = startJob(p, { grants, fresh: !!opt.fresh });
   if (r.already) return { ...summary(p, effectiveStatus(p)), already_running: true };
   return { ok: true, job: fwd(p.J), state: 'starting', engine: r.job.engine, warnings: r.unknown.length ? [`unknown job.json fields: ${r.unknown.join(', ')}`] : [],
     next: `node "${fwd(SELF)}" wait "${fwd(p.J)}" 25` };
@@ -1631,25 +1725,28 @@ function cmdResume(pos, opt) {
   const p = requireJobDir(pos[0], 'resume');
   const st = effectiveStatus(p);
   if (ACTIVE.has(st.state)) throw new UserError('the job is still running', 'Stop it first (node deleg.mjs stop <jobdir>), then resume. A Workflow resume needs the previous run stopped.');
-  const { job } = loadJob(p);
-  const n = (st.attempt || 0) + 1;
-  let rel;
+  const grants = grantsFrom(opt);
+  const { job, promptName } = authorizeJob(p, grants);
+  const n = nextAttempt(st);
+  const rel = `resume-${n}.md`;
+  const brief = fwd(path.resolve(p.J, promptName || 'BRIEF.md'));
+  let text;
   if (pos[1]) {
-    const src = path.resolve(pos[1]); if (!fs.existsSync(src)) throw new UserError(`resume prompt file not found: ${fwd(src)}`, 'Write the instructions to a file and pass its path, or omit it for the automatic continuation.');
-    rel = `resume-${n}.md`; fs.copyFileSync(src, path.join(p.J, rel));
+    const src = path.resolve(pos[1]);
+    if (!fs.statSync(src, { throwIfNoEntry: false })?.isFile()) throw new UserError(`resume prompt is not a regular file: ${fwd(src)}`, 'Write the instructions to a file and pass its path, or omit it for the automatic continuation.');
+    text = fs.readFileSync(src, 'utf8');   // an explicit CLI input, not a path supplied by job metadata
   } else {
     const wfRun = (st.workflow_runs || [])[st.workflow_runs ? st.workflow_runs.length - 1 : 0];
     const wfFile = job.workflow ? path.join(p.wf, path.basename(String(job.workflow)).replace(/\.js$/, '') + '.js') : null;
     const args = readJSON(path.join(p.wf, 'args.json'));
-    let text;
     if (job.engine === 'claude' && wfRun && wfFile && st.session_id) {
-      text = `Resume the workflow of this job. Call the Workflow tool exactly once with scriptPath "${fwd(wfFile)}", resumeFromRunId "${wfRun}" and args ${JSON.stringify(args || {})} (pass args as a JSON object, not a string). Use no other tool before it. Completed agents return their cached results; only unfinished or edited ones run. Then end your turn and wait for the completion notice (do not poll). When it arrives, finish the remaining steps of ${fwd(path.join(p.J, 'BRIEF.md'))} (the workflow result to the outbox, outbox/report.md) and end.\n\nIf the resume is refused (no journal for the run), call the Workflow tool once with the same scriptPath and args and no resumeFromRunId instead: the agents check their files on disk and skip finished work.\n`;
+      text = `Resume the workflow of this job. Call the Workflow tool exactly once with scriptPath "${fwd(wfFile)}", resumeFromRunId "${wfRun}" and args ${JSON.stringify(args || {})} (pass args as a JSON object, not a string). Use no other tool before it. Completed agents return their cached results; only unfinished or edited ones run. Then end your turn and wait for the completion notice (do not poll). When it arrives, finish the remaining steps of ${brief} (the workflow result to the outbox, outbox/report.md) and end.\n\nIf the resume is refused (no journal for the run), call the Workflow tool once with the same scriptPath and args and no resumeFromRunId instead: the agents check their files on disk and skip finished work.\n`;
     } else {
-      text = `Continue this job from where the previous attempt stopped (${st.state}${st.error ? `: ${String(st.error).slice(0, 300)}` : ''}). The instructions are in ${fwd(path.join(p.J, 'BRIEF.md'))}: read it again. Read ${fwd(path.join(p.outbox, 'handoff.md'))} and ${fwd(path.join(p.outbox, 'report.md'))} if they exist, look at what is already in ${fwd(p.outbox)}, and do not redo finished work. Finish exactly as the brief says.\n`;
+      text = `Continue this job from where the previous attempt stopped (${st.state}${st.error ? `: ${String(st.error).slice(0, 300)}` : ''}). The instructions are in ${brief}: read it again. Read ${fwd(path.join(p.outbox, 'handoff.md'))} and ${fwd(path.join(p.outbox, 'report.md'))} if they exist, look at what is already in ${fwd(p.outbox)}, and do not redo finished work. Finish exactly as the brief says.\n`;
     }
-    rel = `resume-${n}.md`; fs.writeFileSync(path.join(p.J, rel), text);
   }
-  const r = startJob(p, { grants: grantsFrom(opt), resume: rel });
+  writeJobPrompt(p.J, rel, text);
+  const r = startJob(p, { grants, resume: rel });
   return { ok: true, job: fwd(p.J), state: 'starting', attempt: n, resume_prompt: rel, session: st.session_id || st.thread_id || null, already_running: !!r.already,
     next: `node "${fwd(SELF)}" wait "${fwd(p.J)}" 25` };
 }
@@ -1844,9 +1941,9 @@ function cmdParse(pos) {   // node deleg.mjs _parse <engine> <stream.jsonl> [job
 async function main() {
   const [, , verb, ...rest] = process.argv;
   const { pos, opt } = parseArgs(rest, verb);
-  if (verb === '_launch2') { const c = spawn(process.execPath, [SELF, '_supervise', pos[0]], { detached: true, stdio: 'ignore', windowsHide: true }); c.unref(); return 0; }
+  if (verb === '_launch2') { const c = spawn(process.execPath, [SELF, '_supervise', pos[0], pos[1] || '{}'], { detached: true, stdio: 'ignore', windowsHide: true }); c.unref(); return 0; }
   if (verb === '_supervise') {
-    try { await supervise(pos[0]); }
+    try { await supervise(pos[0], JSON.parse(pos[1] || '{}')); }
     catch (e) { const p = jobPaths(pos[0]); const st = readJSON(p.status, {}) || {}; writeJSON(p.status, { ...st, state: 'failed', error: `supervisor crashed: ${e.stack || e}`, ended: now() }); }
     return 0;
   }

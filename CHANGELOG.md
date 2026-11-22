@@ -1,7 +1,6 @@
 # Changelog
 
-Each release is a tag `vX.Y.Z`. A bot on an older release reminds its person once ("say update"); `slop update apply`
-installs it and prints the newest entries below.
+Each release is a tag `vX.Y.Z`. The relay can show a reminder once per release. Apply a release with `slop update apply --commit SHA` after independently reviewing its full commit ID. Provision approved dependencies separately.
 
 ## 0.3.7
 - Grok Imagine without the browser: Grok makes Claudia's stills and clips with Grok Bot's own Grok Imagine, from a prompt, a first frame, first and last frames, or up to 14 reference images. Clips come at 720p, the most it makes; when Opus needs 1080p, Grok still makes that clip on grok.com with your X plan. No X sign-in is needed any more.

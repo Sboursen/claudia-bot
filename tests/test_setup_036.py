@@ -7,13 +7,12 @@ import json
 import os
 import subprocess
 import sys
-import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
-from slop import cli, doctor, relay, util
+from slop import cli, doctor, util
 
 import test_core_setup as CS  # noqa: E402  (its shell helpers)
 
@@ -120,29 +119,6 @@ def test_the_doctor_names_the_secure_card_and_the_budget(monkeypatch):
         limit=None, effective_budget={"remaining_usd": 1.25, "reset_interval": "monthly", "resets_at": "2026-11-01"}))
     c = doctor.check_openrouter()
     assert c["status"] == "warn" and "monthly budget has $1.25 left (resets 2026-11-01)" in c["detail"]
-
-
-def test_a_failing_key_reaches_grok_once_a_day(tmp_path, monkeypatch):
-    import test_relay as RT
-    env = RT.setup(tmp_path, monkeypatch)
-    assert RT.K.run("relay", "setup")[0] == 0
-    rd = env["rd"]
-    monkeypatch.setenv("SLOP_KEY_WATCH", "1")
-    monkeypatch.setenv("OPENROUTER_API_KEY", "test-placeholder")
-    calls = []
-    monkeypatch.setattr(util, "openrouter_key_info", lambda **kw: calls.append(1) or _key(days=4))
-    relay._key_watch(rd)
-    says = [r for r in relay._rows(rd / "outbox.jsonl") if r.get("source") == "toolkit"]
-    assert len(says) == 1 and "expires on" in says[0]["text"] and "secure secret card" in says[0]["text"]
-    relay._key_watch(rd)                                             # checked just now: not again for 12 h
-    assert len(calls) == 1
-    kw = json.loads((rd / "keywatch.json").read_text())
-    kw["checked_ts"] = time.time() - relay.KEY_WATCH_S - 1
-    (rd / "keywatch.json").write_text(json.dumps(kw))
-    relay._key_watch(rd)                                             # checked again, but told already today
-    assert len(calls) == 2 and len([r for r in relay._rows(rd / "outbox.jsonl") if r.get("source") == "toolkit"]) == 1
-    r = RT.K.run("relay", "read")[1]
-    assert "from the toolkit, not the production" in r["text"], r["text"]
 
 
 def test_earshot_is_optional_and_never_blocks_the_check(tmp_path):

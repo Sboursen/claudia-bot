@@ -214,6 +214,7 @@ def test_codex_stdin_closed_then_resume_in_same_thread(tmp_path, cleanup):
     a = c["argv"]
     assert a[:2] == ["exec", "--json"] and a[-1] == "-" and "workspace-write" in a and "-C" in a
     assert 'forced_login_method="chatgpt"' in a
+    assert "sandbox_workspace_write.network_access=false" in a
     assert st["thread_id"] == "00000000-0000-7000-8000-00000000c0de"
     r = out(deleg("resume", j))
     assert r["ok"] and r["session"] == st["thread_id"]
@@ -225,6 +226,7 @@ def test_codex_stdin_closed_then_resume_in_same_thread(tmp_path, cleanup):
     a2 = calls(j)[1]["argv"]
     assert a2[:2] == ["exec", "resume"] and 'sandbox_mode="workspace-write"' in a2 and a2[-2:] == [st["thread_id"], "-"]
     assert "-s" not in a2 and "-C" not in a2
+    assert "sandbox_workspace_write.network_access=false" in a2
 
 
 def test_muse_no_auto_update_and_session_resume(tmp_path, cleanup):
@@ -383,6 +385,68 @@ def test_job_file_is_adopted_into_a_folder(tmp_path, cleanup):
     j = jobs / "20261001-abcd-test"
     assert (j / "job.json").exists() and read(j / "BRIEF.md").startswith("# from a single file")
     assert out(r)["job"].endswith("20261001-abcd-test")
+
+
+def test_imported_codex_network_needs_a_separate_grant(tmp_path, cleanup):
+    jobs = tmp_path / "jobs"
+    jobs.mkdir()
+    j = jobs / "network"
+    imported = jobs / "network.job.json"
+    imported.write_text(json.dumps({"engine": "codex", "brief": "# local test", "network": True,
+                                    "engine_bin": ["node", str(FAKE), "--as", "codex"]}), encoding="utf-8")
+
+    denied = deleg("run", imported)  # The test helper already supplies --allow-raw for the fake executable.
+    assert denied.returncode == 1 and "--allow-network" in out(denied)["fix"]
+    assert not j.exists(), "refuse before adopting the job or materializing its prompt"
+
+    cleanup.append(j)
+    accepted = deleg("run", imported, "--allow-network")
+    assert accepted.returncode == 0 and status(j)["state"] == "done"
+    assert "sandbox_workspace_write.network_access=true" in calls(j)[0]["argv"]
+
+
+def test_nested_custom_prompt_survives_adoption_and_retry(tmp_path, cleanup):
+    jobs = tmp_path / "jobs"
+    j = jobs / "custom"
+    prompt = j / "briefs" / "custom.md"
+    prompt.parent.mkdir(parents=True)
+    prompt.write_text("# local prompt for {{JOB_ID}}\n", encoding="utf-8")
+    imported = jobs / "custom.job.json"
+    job = {"engine": "claude", "brief": "# fallback", "prompt_file": "briefs/custom.md",
+           "engine_bin": ["node", str(FAKE), "--as", "claude"]}
+    imported.write_text(json.dumps(job), encoding="utf-8")
+
+    cleanup.append(j)
+    assert deleg("run", imported).returncode == 0
+    assert read(prompt) == "# local prompt for custom\n"
+    assert read(j / "prompt-1.md").endswith(read(prompt))
+    assert not (j / "BRIEF.md").exists()
+
+    assert deleg("run", imported).returncode == 0
+    assert status(j)["attempt"] == 1
+    assert not (j / "history").exists()
+
+    job["brief"] = "# replacement prompt\n"
+    imported.write_text(json.dumps(job), encoding="utf-8")
+    assert deleg("run", imported).returncode == 0
+    assert read(prompt) == "# replacement prompt\n"
+    assert read(j / "history" / "1" / "briefs" / "custom.md") == "# local prompt for custom\n"
+
+
+def test_custom_prompt_requires_real_parent_directories(tmp_path):
+    j = make_job(tmp_path, "linked", prompt_file="linked/custom.md")
+    real = j / "local"
+    real.mkdir()
+    (real / "custom.md").write_text("# local prompt\n", encoding="utf-8")
+    try:
+        (j / "linked").symlink_to(real, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("directory symlinks are unavailable")
+
+    denied = deleg("start", j)
+    assert denied.returncode == 1 and "use real directories" in out(denied)["fix"].lower()
+    assert not (j / "outbox").exists() and not (j / "status.json").exists()
+    assert read(real / "custom.md") == "# local prompt\n"
 
 
 def test_queue_respects_max_parallel(tmp_path, cleanup):

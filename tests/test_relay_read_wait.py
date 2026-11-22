@@ -53,6 +53,6 @@ def test_a_misread_keeps_waiting(tmp_path, monkeypatch):
 
 def test_new_items_still_end_the_wait_at_once(tmp_path, monkeypatch):
     _ready(tmp_path, monkeypatch)
-    K.run("relay", "send", "hello")
-    items, r = RT.collect(lambda it, r: any("heard #1" in i["text"] for i in it))
-    assert r["waited_s"] < 30
+    assert K.run("relay", "say", "local reply")[0] == 0
+    rc, read = K.run("relay", "read", "--wait", "30")
+    assert rc == 0 and read["items"][0]["text"] == "local reply" and read["waited_s"] < 30
