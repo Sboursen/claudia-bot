@@ -200,9 +200,10 @@ class FakeSession:
         self.routes = routes
         self.calls: list[dict] = []
 
-    def request(self, method, url, headers=None, data=None, timeout=None, stream=False):
+    def request(self, method, url, headers=None, data=None, timeout=None, stream=False, allow_redirects=True):
         body = json.loads(data) if data else None
-        self.calls.append({"method": method, "url": url, "headers": dict(headers or {}), "body": body})
+        self.calls.append({"method": method, "url": url, "headers": dict(headers or {}), "body": body,
+                           "allow_redirects": allow_redirects})
         for (m, sub), resp in self.routes.items():
             if m == method and sub in url:
                 if callable(resp) and not isinstance(resp, FakeResp):

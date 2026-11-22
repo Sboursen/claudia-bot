@@ -1,7 +1,8 @@
 """OpenRouter HTTP client (requests): auth, retries, error mapping, data URLs.
 
-Headers: `Authorization: Bearer $OPENROUTER_API_KEY` (the key is read from the environment only and never printed),
+Headers: `Authorization: Bearer $OPENROUTER_API_KEY` for the OpenRouter API origin,
 `HTTP-Referer: claudia`, `X-Title: claudia`, `User-Agent: claudia/<version>`.
+An explicitly configured HTTPS API origin requires its own key. Authenticated requests do not follow redirects.
 
 Retries: 429 and 5xx (and network errors on GETs) are retried with exponential backoff (2, 4, 8, 16 s, capped at 30 s; a
 `Retry-After` header wins). 4xx are never retried. Paid POSTs are not re-sent once the request may have reached the
@@ -36,13 +37,16 @@ import mimetypes
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterator
+from urllib.parse import urlsplit
 
 from .. import __version__
 from ..config import SlopError, require_env
 
 BASE = "https://openrouter.ai/api/v1"
+API_ORIGIN = ("openrouter.ai", 443)
 APP = "claudia"
 INLINE_LIMIT = 3_000_000          # images above this go in re-encoded (the request is capped at ~32 MB)
+VIDEO_DOWNLOAD_LIMIT = 256 * 1024 * 1024
 
 ADVICE = {
     "credits": "OpenRouter says the account is out of credits (402). Top up at https://openrouter.ai/settings/credits, "
@@ -153,6 +157,43 @@ def make_error(http: int | None, text: str, where: str = "") -> ProviderError:
     return ProviderError(head + ((" — " + adv) if adv else ""), status=st, http=http, detail=text, head=head)
 
 
+def _https_origin(url: str) -> tuple[str, int]:
+    try:
+        if not url or "\\" in url or any(ord(c) <= 32 or ord(c) == 127 for c in url):
+            raise ValueError
+        parts = urlsplit(url)
+        host, port = parts.hostname, parts.port
+        if (parts.scheme != "https" or not host or parts.username is not None or parts.fragment
+                or port == 0):
+            raise ValueError
+        return host, 443 if port is None else port
+    except ValueError:
+        raise ProviderError("OpenRouter destination must be a valid HTTPS URL", status="bad_request") from None
+
+
+def _download_redirect(url: str, timeout: float) -> bytes:
+    """Fetch a signed video URL without the API session's credentials."""
+    _https_origin(url)
+    import requests
+
+    try:
+        with requests.Session() as session:
+            session.trust_env = False
+            with session.get(url, timeout=timeout, stream=True, allow_redirects=False) as response:
+                if response.status_code != 200:
+                    raise ProviderError("OpenRouter video download URL did not return video data",
+                                        status="server", http=response.status_code)
+                result = bytearray()
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if len(result) + len(chunk) > VIDEO_DOWNLOAD_LIMIT:
+                        raise ProviderError("OpenRouter video download exceeds the size limit", status="too_large")
+                    result.extend(chunk)
+    except requests.RequestException:
+        # A transport exception can contain the signed query string.
+        raise ProviderError("Could not retrieve the OpenRouter video download", status="network") from None
+    return bytes(result)
+
+
 class OpenRouter:
     """Small client. `session` is any object with requests.Session's .request(); tests inject a fake."""
 
@@ -162,6 +203,9 @@ class OpenRouter:
         self._key = key
         self.session = session
         self.base = base.rstrip("/")
+        self._origin = _https_origin(self.base)
+        if urlsplit(self.base).query:
+            raise ProviderError("OpenRouter API base must not contain a query", status="bad_request")
         self.retries = retries
         self.backoff = backoff
         self.max_backoff = max_backoff
@@ -177,6 +221,8 @@ class OpenRouter:
 
     def key(self) -> str:
         if not self._key:
+            if self._origin != API_ORIGIN:
+                raise ProviderError("A custom OpenRouter API base requires an explicit key", status="bad_request")
             self._key = require_env("OPENROUTER_API_KEY", "needed for OpenRouter image/video/song generation")
         return self._key
 
@@ -189,7 +235,13 @@ class OpenRouter:
         return h
 
     def url(self, path: str) -> str:
-        return path if path.startswith("http") else self.base + "/" + path.lstrip("/")
+        if not isinstance(path, str):
+            raise ProviderError("OpenRouter request URL is invalid", status="bad_request")
+        try:
+            parts = urlsplit(path)
+        except ValueError:
+            raise ProviderError("OpenRouter request URL is invalid", status="bad_request") from None
+        return path if parts.scheme or parts.netloc else self.base + "/" + path.lstrip("/")
 
     def _delay(self, attempt: int, resp: Any = None) -> float:
         if resp is not None:
@@ -203,19 +255,26 @@ class OpenRouter:
 
     def request(self, method: str, path: str, *, json_body: Any = None, auth: bool = True, raw: bool = False,
                 stream: bool = False, retry_5xx: bool = True, retry_network: bool | None = None,
-                timeout: float | None = None, where: str = "") -> Any:
+                timeout: float | None = None, where: str = "", media_redirect: bool = False) -> Any:
         """JSON (default), raw bytes (raw=True) or the streaming response (stream=True).
-        retry_network (default: GET or retry_5xx): re-send after a timeout / dropped connection. Paid POSTs pass False."""
+        retry_network (default: GET or retry_5xx): re-send after a timeout / dropped connection. Paid POSTs pass False.
+        Video downloads can accept a single signed HTTPS redirect in a separate, credential-free request."""
+        url = self.url(path)
+        if auth and _https_origin(url) != self._origin:
+            raise ProviderError("OpenRouter authenticated request is outside its configured HTTPS origin",
+                                status="bad_request")
+
         import requests
         method = method.upper()
+        timeout = timeout or self.timeout
         data = json.dumps(json_body).encode() if json_body is not None else None
         h = self.headers(auth=auth, json_body=json_body is not None)
         resend = retry_network if retry_network is not None else (method == "GET" or retry_5xx)
         last: Any = None
         for attempt in range(self.retries + 1):
             try:
-                r = self._sess().request(method, self.url(path), headers=h, data=data, timeout=timeout or self.timeout,
-                                         stream=stream)
+                r = self._sess().request(method, url, headers=h, data=data, timeout=timeout, stream=stream,
+                                         allow_redirects=not auth)
             except (requests.ConnectionError, requests.Timeout) as e:
                 safe = method == "GET" or resend or never_sent(e)
                 if attempt < self.retries and safe:
@@ -223,6 +282,15 @@ class OpenRouter:
                 st = "network" if safe else "unknown_outcome"
                 raise ProviderError(f"OpenRouter {where or path}: {type(e).__name__} — {ADVICE[st]}", status=st) from e
             code = int(getattr(r, "status_code", 0) or 0)
+            if auth and 300 <= code < 400:
+                if media_redirect and method == "GET" and raw and code in (301, 302, 303, 307, 308):
+                    location = (getattr(r, "headers", None) or {}).get("Location")
+                    if location:
+                        return _download_redirect(location, timeout)
+                if method not in ("GET", "HEAD"):
+                    raise ProviderError(f"OpenRouter returned an unexpected redirect. {ADVICE['unknown_outcome']}",
+                                        status="unknown_outcome", http=code)
+                raise ProviderError("OpenRouter returned an unexpected redirect", status="server", http=code)
             if code == 429 or (code >= 500 and (retry_5xx or method == "GET")):
                 last = r
                 if attempt < self.retries:
@@ -241,6 +309,9 @@ class OpenRouter:
             try:
                 return r.json()
             except ValueError as e:
+                if 200 <= code < 300 and method == "POST" and not resend:
+                    raise ProviderError(f"OpenRouter {where or path}: response was not JSON. "
+                                        f"{ADVICE['unknown_outcome']}", status="unknown_outcome", http=code) from None
                 raise ProviderError(f"OpenRouter {where or path}: response was not JSON ({str(e)[:100]})", status="server",
                                     http=code) from e
         txt = error_text(getattr(last, "content", b"") or "") if last is not None else ""

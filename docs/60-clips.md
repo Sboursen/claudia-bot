@@ -440,9 +440,10 @@ rich cinematic detail`, or drop the video reference.
 - **Price:** video tokens = width × height × 24 × seconds / 1024, at **$0.0000107** per token →
   **$0.231/s at 720p** (1280×720; 4 s = $0.92, 5 s = $1.16, 8 s = $1.85) and **$0.103/s at 480p** (854×480; 4 s = $0.41).
   With a video reference the rate is $0.0000064 per token, and input-video seconds count too.
-- `POST https://openrouter.ai/api/v1/videos` → `{id, polling_url}`; poll with backoff (5 s rising to 20 s) until
-  `completed | failed | cancelled | expired`; download `GET /api/v1/videos/{id}/content?index=0` with the key. A response
-  with no job id was **not submitted** — never count it, never assume it.
+- `POST https://openrouter.ai/api/v1/videos` returns a job ID. Poll the configured OpenRouter API using that ID
+  until `completed | failed | cancelled | expired`, then request `GET /api/v1/videos/{id}/content?index=0`.
+  A successful submission response without a usable ID has an **unknown outcome**. Check OpenRouter activity
+  before retrying to avoid a possible second charge.
 - Fields: `prompt`, `duration` (the API takes 4–30; use 4–8 for sung windows and 4–12 for motion), `resolution`
   (`480p`/`720p`), `aspect_ratio` `16:9`, `generate_audio`, `input_references` (images, `audio_url`, `video_url`),
   `frame_images` (first/last frame). **Sending `frame_images` makes OpenRouter ignore all `input_references`, the audio

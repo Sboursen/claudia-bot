@@ -1324,7 +1324,7 @@ def submit(pdir: Path, cid: str, *, provider: str | None = None, yes: bool = Fal
         r = vid.submit(client, body)
     except ProviderError as e:
         return _record_submit_error(pdir, c, e, model, est, body, audio_url)
-    tk = _new_take(c, provider="openrouter", id=r["id"], polling_url=r.get("polling_url"), status="submitted", model=model,
+    tk = _new_take(c, provider="openrouter", id=r["id"], status="submitted", model=model,
                    est_usd=est, body=vid.summary(body),
                    ref_audio=(c.get("window") or {}).get("wav") if audio_url else None)
     c["status"] = "submitted"
@@ -1528,6 +1528,7 @@ def poll(pdir: Path, cids: list[str] | None = None, *, wait_s: float = 0.0, job_
     if job_id:
         if not cids or len(cids) != 1:
             raise SlopError("--job-id attaches one job to one clip: slop clip poll CLIP --job-id JOB_ID")
+        job_id = vid.validate_job_id(job_id.strip())
         c = store.load(pdir, cids[0])
         unk = store.unknown_take(c)
         if not unk:
@@ -1536,11 +1537,11 @@ def poll(pdir: Path, cids: list[str] | None = None, *, wait_s: float = 0.0, job_
             else:
                 raise SlopError(f"{cids[0]} has no take with an unknown outcome to attach {job_id} to")
         else:
-            unk.update(id=job_id.strip(), status="submitted", attached=store.now())
+            unk.update(id=job_id, status="submitted", attached=store.now())
             c["status"] = "submitted"
             store.save(pdir, c)
             ledger.record(pdir, provider="openrouter", model=unk.get("model", ""), kind="video-attach", est_usd=0.0,
-                          request_id=job_id.strip(), status="ok", units={"clip": c["id"], "take": unk["n"]},
+                          request_id=job_id, status="ok", units={"clip": c["id"], "take": unk["n"]},
                           note="job id attached to the unknown-outcome take (its estimate is already counted)")
             attached = unk["n"]
     clips = [store.load(pdir, x) for x in cids] if cids else [c for c in store.all_clips(pdir) if c.get("status") == "submitted"]
@@ -1565,7 +1566,7 @@ def poll(pdir: Path, cids: list[str] | None = None, *, wait_s: float = 0.0, job_
                                                                            if unk else {})})
             lines.append(msg); continue
         kw = {"sleep": sleep} if sleep else {}
-        stt = vid.wait(client, tk["id"], tk.get("polling_url"), wait_s, **kw)
+        stt = vid.wait(client, tk["id"], max_s=wait_s, **kw)
         state = stt.get("status")
         tk["result"] = {k: v for k, v in stt.items() if k not in ("unsigned_urls",)}
         if state == "completed":
