@@ -34,7 +34,10 @@ Licences: only OFL faces are offered; Nimbus Sans, Junicode, Pilcrow Rounded and
 """
 from __future__ import annotations
 
+import hashlib
+import io
 import itertools
+import json
 import math
 import random
 import re
@@ -44,15 +47,20 @@ from pathlib import Path
 import numpy as np
 
 from .. import util
-from ..config import SlopError, engine_dir, load_project
+from ..config import SlopError, engine_dir
 from . import model as M
-from .store import append_jsonl, fonts_dir, new_eid, now_iso, read_events, read_json, write_json
+from .assets import FONT_LIMIT, JPEG_LIMIT, profile_asset, read_file, write_file
+from .store import append_jsonl, fonts_dir, new_eid, now_iso, read_events, write_json
 
 DEFAULT_FAMILIES = ["Space Grotesk", "Geist", "DINish", "Barlow Condensed", "IBM Plex Mono", "Share Tech Mono",
                     "Instrument Serif", "Audiowide"]
 BANNED = ("nimbus", "junicode", "pilcrow", "alchimia")       # not OFL / not shippable
 WEIGHT_PREF = ["medium", "regular", "semibold", "book", "bold", "light", ""]
 FONT_EXT = (".ttf", ".otf", ".woff2", ".woff")
+FONT_MAGIC = {".ttf": (b"\x00\x01\x00\x00", b"true"), ".otf": (b"OTTO",),
+              ".woff": (b"wOFF",), ".woff2": (b"wOF2",)}
+FONT_ASSET = re.compile(r"[0-9a-f]{64}\.(?:ttf|otf|woff2?)\Z")
+SESSION_VERSION = 2
 MIN_GAP = 20
 MAX_FONTS = 9
 DISPLAY_PCT_W = 4.97          # round 001-A display size, % of frame width
@@ -66,9 +74,13 @@ PLACEHOLDER_LINE = "the quick brown fox jumps over the lazy dog"
 def sfnt_names(path: Path) -> dict:
     """family/subfamily from an OpenType/TrueType 'name' table (no fontTools needed); {} if unreadable"""
     try:
-        data = Path(path).read_bytes()
-    except OSError:
+        path = Path(path)
+        return _sfnt_names(read_file(path.parent, path.name, FONT_LIMIT))
+    except (OSError, ValueError):
         return {}
+
+
+def _sfnt_names(data: bytes) -> dict:
     if len(data) < 12 or data[:4] not in (b"\x00\x01\x00\x00", b"OTTO", b"true"):
         return {}
     try:
@@ -122,14 +134,22 @@ def scan_fonts(dirs: list[Path]) -> list[dict]:
         if not d.is_dir():
             continue
         for p in sorted(d.rglob("*")):
-            if p.suffix.lower() not in FONT_EXT or not p.is_file():
+            ext = p.suffix.lower()
+            if ext not in FONT_EXT:
                 continue
-            meta = sfnt_names(p) if p.suffix.lower() in (".ttf", ".otf") else {}
+            try:
+                data = read_file(d, p.relative_to(d), FONT_LIMIT)
+            except (OSError, ValueError):
+                continue
+            if not data.startswith(FONT_MAGIC[ext]):
+                continue
+            meta = _sfnt_names(data) if ext in (".ttf", ".otf") else {}
             fn = _from_filename(p)
             fam = meta.get("family") or fn["family"]
             if any(b in _norm(fam) or b in _norm(p.name) for b in BANNED):
                 continue
             out.append({"family": fam, "style": meta.get("style") or fn["style"], "path": str(p), "file": p.name,
+                        "source_root": d, "source_relative": p.relative_to(d), "digest": hashlib.sha256(data).hexdigest(),
                         "variable": bool(meta.get("variable") or fn["variable"]), "key": _norm(fam),
                         "file_key": _norm(p.stem.split("-")[0].split("[")[0])})
     return out
@@ -154,6 +174,7 @@ def pick_faces(fonts: list[dict], families: list[str]) -> list[dict]:
         best = sorted(cands, key=lambda f: (rank(f), f["file"]))[0]
         weight = 500 if best["variable"] else {"medium": 500, "semibold": 600, "bold": 700, "light": 300}.get(_norm(best["style"]), 400)
         out.append({"family": fam, "file": best["file"], "path": best["path"], "weight": weight,
+                    "source_root": best["source_root"], "source_relative": best["source_relative"], "digest": best["digest"],
                     "css": "F" + _norm(fam)[:24]})
     return out
 
@@ -167,42 +188,58 @@ def font_dirs(extra: str | None = None) -> list[Path]:
 
 # ---------------------------------------------------------------- frame, lines, schedule
 
-def find_frame(pdir: Path, frame: str | None = None) -> tuple[Path | None, str]:
+def _json_file(root: Path, relative: str | Path) -> dict:
+    try:
+        value = json.loads(read_file(root, relative, 4 * 1024 * 1024))
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _project_frame(pdir: Path, candidates) -> bytes | None:
+    for path in candidates:
+        if Path(path).suffix.lower() not in (".jpg", ".jpeg", ".png", ".webp"):
+            continue
+        try:
+            return read_file(pdir, path, JPEG_LIMIT)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def find_frame(pdir: Path, frame: str | None = None) -> tuple[bytes | None, str]:
     if frame:
         p = Path(frame).expanduser()
         if not p.is_absolute():
             p = (pdir / p) if (pdir / p).exists() else p
-        if not p.is_file():
-            raise SlopError(f"--frame {frame} does not exist")
-        return p, "--frame"
-    try:
-        proj = load_project(pdir)
-    except (OSError, ValueError):
-        proj = {}
+        try:
+            return read_file(p.parent, p.name, JPEG_LIMIT), "--frame"
+        except (OSError, ValueError):
+            raise SlopError(f"--frame {frame} is not a readable preview file") from None
+    proj = _json_file(pdir, "project.json")
     hero = ((proj.get("look") or {}).get("hero_plate"))
-    if hero:
-        for c in (pdir / hero, pdir / "plates" / hero):
-            if c.is_file():
-                return c, "project.json look.hero_plate"
-        hits = sorted((pdir / "plates").rglob(f"{hero}*.jpg")) + sorted((pdir / "plates").rglob(f"{hero}*.png")) \
-            if (pdir / "plates").is_dir() else []
-        if hits:
-            return hits[0], "project.json look.hero_plate"
-    picks = read_json(pdir / "plates" / "picks.json", {}) or {}
+    if isinstance(hero, str) and hero:
+        data = _project_frame(pdir, (hero, Path("plates") / hero))
+        if data is None and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", hero) and not (pdir / "plates").is_symlink():
+            hits = sorted((pdir / "plates").rglob(f"{hero}*.jpg")) + sorted((pdir / "plates").rglob(f"{hero}*.png"))
+            data = _project_frame(pdir, (p.relative_to(pdir) for p in hits))
+        if data is not None:
+            return data, "project.json look.hero_plate"
+    picks = _json_file(pdir, "plates/picks.json")
     for _, v in picks.items():
         f = v.get("file") if isinstance(v, dict) else None
-        if f:
-            for c in (pdir / f, pdir / "plates" / f):
-                if c.is_file():
-                    return c, "plates/picks.json"
+        if isinstance(f, str) and f:
+            data = _project_frame(pdir, (f, Path("plates") / f))
+            if data is not None:
+                return data, "plates/picks.json"
     return None, "none"
 
 
-def prepare_frame(src: Path | None, out: Path) -> dict:
-    """copy the style frame (long side <= 1920) or synthesise a neutral dark ground; -> {ink, lum, provisional}"""
+def prepare_frame(src: bytes | None) -> tuple[bytes, dict]:
+    """Encode a staged style frame or synthesize a neutral dark ground."""
     from PIL import Image, ImageFilter
     if src is not None:
-        im = Image.open(src)
+        im = Image.open(io.BytesIO(src))
         im.draft("RGB", (1920, 1920))
         im = im.convert("RGB")
         if max(im.size) > 1920:
@@ -216,12 +253,13 @@ def prepare_frame(src: Path | None, out: Path) -> dict:
         arr = np.clip(np.stack([base, base * 1.02, base * 1.08], -1), 0, 255).astype("uint8")
         im = Image.fromarray(arr).filter(ImageFilter.GaussianBlur(1))
         provisional = True
-    im.save(out, quality=90)
+    out = io.BytesIO()
+    im.save(out, format="JPEG", quality=90)
     g = np.asarray(im.convert("L"), dtype=float) / 255
     h, w = g.shape
     band = g[int(h * 0.62):int(h * 0.92), int(w * 0.04):int(w * 0.80)]
     lum = float(band.mean()) if band.size else float(g.mean())
-    return {"ink": "#f3f1ea" if lum < 0.55 else "#121212", "lum": round(lum, 3), "provisional": provisional,
+    return out.getvalue(), {"ink": "#f3f1ea" if lum < 0.55 else "#121212", "lum": round(lum, 3), "provisional": provisional,
             "w": im.width, "h": im.height}
 
 
@@ -238,11 +276,12 @@ def read_lines(pdir: Path, texts: list[str] | None, n: int) -> tuple[list[str], 
     if texts:
         return [clean_line(t) for t in texts if clean_line(t)][:max(n, 1)], "--text"
     for rel in ("lyrics/display.txt", "lyrics/lyrics.txt"):
-        f = pdir / rel
-        if not f.is_file():
+        try:
+            text = read_file(pdir, rel, 1024 * 1024).decode("utf-8")
+        except (OSError, UnicodeError):
             continue
         lines = []
-        for raw in util.read_lyric_lines(f):         # the shared lyric-line rule (blank and [tag] lines skipped)
+        for raw in util.lyric_lines(text):
             t = clean_line(raw)
             if t and 2 <= len(t.split()) <= 9 and len(t) <= 60:
                 lines.append(t)
@@ -292,17 +331,34 @@ def taps_file(pdir: Path) -> Path:
     return fonts_dir(pdir) / "taps.jsonl"
 
 
+def _font_asset(face: dict) -> str | None:
+    asset = face.get("asset")
+    return asset if isinstance(asset, str) and FONT_ASSET.fullmatch(asset) else None
+
+
+def _session(pdir: Path) -> dict | None:
+    root, relative = profile_asset(pdir, "fonts/session.json")
+    session = _json_file(root, relative)
+    faces = session.get("fonts")
+    if session.get("version") != SESSION_VERSION or not isinstance(faces, list) or not 2 <= len(faces) <= MAX_FONTS:
+        return None
+    for face in faces:
+        if not isinstance(face, dict) or not _font_asset(face) or not isinstance(face.get("file"), str):
+            return None
+    return session
+
+
 def setup(pdir: Path, frame: str | None = None, families: list[str] | None = None, texts: list[str] | None = None,
           n_lines: int = 6, seed: int | None = None, extra_dir: str | None = None, reset: bool = False) -> dict:
     pdir = Path(pdir)
-    sp = session_path(pdir)
-    cur = read_json(sp)
-    from .profile import project_name
-    pname = project_name(pdir)
+    cur = _session(pdir)
+    pname = str(_json_file(pdir, "project.json").get("name") or pdir.name)
     # a shared (user) profile: another project's session uses that project's lines and frame -> a new session for
     # this project (the old picks are kept and still count in the ranking)
     if cur and not reset and cur.get("project", pname) == pname:
-        return {"session": cur, "created": False}
+        current = FontSession(pdir)
+        if current.frame_bytes() is not None and all(current.font_bytes(f["file"]) is not None for f in cur["fonts"]):
+            return {"session": cur, "created": False}
     fonts = scan_fonts(font_dirs(extra_dir))
     wanted = families or DEFAULT_FAMILIES
     faces = pick_faces(fonts, wanted)[:MAX_FONTS]
@@ -313,16 +369,33 @@ def setup(pdir: Path, frame: str | None = None, families: list[str] | None = Non
                         "Run bin/setup.sh (installs the engine fonts) or pass --fonts-dir / --families")
     lines, lines_src = read_lines(pdir, texts, n_lines)
     src, frame_src = find_frame(pdir, frame)
-    fr = prepare_frame(src, fonts_dir(pdir) / "frame.jpg")
+    frame_data, fr = prepare_frame(src)
+    root, frame_relative = profile_asset(pdir, "fonts/frame.jpg")
+    staged_faces = []
+    for f in faces:
+        suffix = Path(f["file"]).suffix.lower()
+        try:
+            data = read_file(f["source_root"], f["source_relative"], FONT_LIMIT)
+            if hashlib.sha256(data).hexdigest() != f["digest"]:
+                raise OSError("font changed during setup")
+            asset = f["digest"] + suffix
+            write_file(root, frame_relative.parent / "assets" / asset, data)
+        except (OSError, ValueError) as e:
+            raise SlopError(f"could not stage font {f['file']}: {e}") from None
+        staged_faces.append({k: f[k] for k in ("family", "file", "weight", "css")} | {"asset": asset})
+    write_file(root, frame_relative, frame_data)
     seed = random.randrange(1 << 30) if seed is None else int(seed)
     weights = sorted({f["weight"] for f in faces})
     note = None if len(weights) == 1 else ("weights differ (" + ", ".join(f"{f['family']} {f['weight']}" for f in faces)
                                            + "): only the weights shipped in engine/fonts are used")
-    sess = {"id": new_eid(), "created": now_iso(), "project": pname, "seed": seed, "fonts": faces, "lines": lines,
+    sess = {"version": SESSION_VERSION, "id": new_eid(), "created": now_iso(), "project": pname, "seed": seed,
+            "fonts": staged_faces, "lines": lines,
             "weights_note": note,
-            "lines_source": lines_src, "frame_source": frame_src, "frame": "frame.jpg", **fr,
+            "lines_source": lines_src, "frame_source": frame_src, "frame": "frame.jpg",
+            "frame_sha256": hashlib.sha256(frame_data).hexdigest(), **fr,
             "display_pct_w": DISPLAY_PCT_W, "cards": schedule(len(faces), len(lines), seed)}
-    write_json(sp, sess)
+    write_file(root, frame_relative.parent / "session.json",
+               (json.dumps(sess, indent=1, ensure_ascii=False) + "\n").encode("utf-8"))
     return {"session": sess, "created": True}
 
 
@@ -331,10 +404,10 @@ class FontSession:
 
     def __init__(self, pdir: Path):
         self.pdir = Path(pdir)
-        self.sess = read_json(session_path(self.pdir))
+        self.sess = _session(self.pdir)
 
     def reload(self) -> None:
-        self.sess = read_json(session_path(self.pdir))
+        self.sess = _session(self.pdir)
 
     def picks(self) -> list[dict]:
         if not self.sess:
@@ -350,7 +423,8 @@ class FontSession:
 
     def next(self, exclude: list[str], n: int = 4) -> dict:
         if not self.sess:
-            return {"cards": [], "progress": self.progress(), "error": "no font session: run `slop taste fonts`"}
+            return {"cards": [], "progress": self.progress(),
+                    "error": "no staged font session: run `slop taste fonts` to build or refresh it"}
         done = {e.get("card") for e in self.picks()}
         ex = {k for k in exclude}
         out = [self.card_json(c) for c in self.sess["cards"] if c["card"] not in done and f"f:{c['card']}" not in ex][:n]
@@ -382,13 +456,41 @@ class FontSession:
         if eid:
             append_jsonl(taps_file(self.pdir), {"undo": str(eid)[:20], "t": now_iso()})
 
+    def _asset_name(self, name: str) -> str | None:
+        return next((_font_asset(f) for f in (self.sess or {}).get("fonts", []) if f.get("file") == name), None)
+
     def font_path(self, name: str) -> Path | None:
-        if not self.sess:
+        """Compatibility accessor for the staged path. HTTP reads through font_bytes."""
+        asset = self._asset_name(name)
+        if asset is None:
             return None
-        for f in self.sess["fonts"]:
-            if f["file"] == name:
-                return Path(f["path"])
+        root, relative = profile_asset(self.pdir, f"fonts/assets/{asset}")
+        return root / relative
+
+    def font_bytes(self, name: str) -> tuple[bytes, str] | None:
+        asset = self._asset_name(name)
+        if asset is None:
+            return None
+        root, relative = profile_asset(self.pdir, f"fonts/assets/{asset}")
+        try:
+            data = read_file(root, relative, FONT_LIMIT)
+        except (OSError, ValueError):
+            return None
+        suffix = relative.suffix
+        if data.startswith(FONT_MAGIC[suffix]) and hashlib.sha256(data).hexdigest() == relative.stem:
+            return data, suffix
         return None
+
+    def frame_bytes(self) -> bytes | None:
+        digest = (self.sess or {}).get("frame_sha256")
+        if not isinstance(digest, str):
+            return None
+        root, relative = profile_asset(self.pdir, "fonts/frame.jpg")
+        try:
+            data = read_file(root, relative, JPEG_LIMIT)
+        except (OSError, ValueError):
+            return None
+        return data if data.startswith(b"\xff\xd8\xff") and hashlib.sha256(data).hexdigest() == digest else None
 
     def progress(self) -> dict:
         if not self.sess:

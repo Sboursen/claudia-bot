@@ -253,7 +253,8 @@ def test_a_wired_chapter_is_loaded_by_the_engine_page(tmp_path):
     (ch / "01_a.js").write_text("throw new Error('chapter C1 was loaded');\n", encoding="utf-8")
     (ch / "02_b.js").write_text("throw new Error('chapter C2 was loaded');\n", encoding="utf-8")
     r = subprocess.run([sys.executable, "-m", "slop", "--json", "--project", str(proj), "render", "info", "--size", "320x180"], cwd=ROOT,
-                       capture_output=True, text=True, timeout=180, env=env(PYTHONPATH=str(ROOT)), encoding="utf-8")
+                       capture_output=True, text=True, timeout=180,
+                       env=env(PYTHONPATH=str(ROOT), SLOP_RENDER_TRUST_PROJECT_SCRIPTS="1"), encoding="utf-8")
     info = json.loads(r.stdout.strip().splitlines()[-1])
     if "browser" in str(info.get("error", "")):
         pytest.skip(f"no browser here: {info['error'][:200]}")

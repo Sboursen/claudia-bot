@@ -19,13 +19,15 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import re
 import time
 from pathlib import Path
 
 from ..config import SlopError
 from . import net
-from .store import append_jsonl, images_dir, now_iso, pool_index, read_jsonl
+from .assets import JPEG_LIMIT, profile_asset, read_file, write_file
+from .store import append_jsonl, now_iso, pool_index
 
 MIN_LONG_SIDE = 300      # crawl.py: skip long side < 300 px
 MAX_LONG_SIDE = 1024     # crawl.py: resize to long side <= 1024 (LANCZOS)
@@ -36,15 +38,27 @@ MAX_DOWNLOAD = 25 * 1024 * 1024
 DOWNLOAD_INTERVAL = 0.5  # politeness between image downloads (crawl.py paced CDN downloads too)
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
 KINDS = ("human", "generated")
+POOL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 
 
 def load_pool(pdir: Path, root: Path | None = None) -> dict[str, dict]:
     """{id: item}, in insertion order; the last row per id wins; rows with "removed" drop the id. `root`: read
     this taste profile root instead of the project's current one (a Feed keeps the root it started with)"""
     out: dict[str, dict] = {}
-    for r in read_jsonl(Path(root) / "pool" / "pool.jsonl" if root is not None else pool_index(pdir)):
+    anchor, relative = profile_asset(pdir, "pool/pool.jsonl", root)
+    try:
+        rows = read_file(anchor, relative, 64 * 1024 * 1024).splitlines()
+    except OSError:
+        return out
+    for line in rows:
+        try:
+            r = json.loads(line)
+        except (ValueError, UnicodeError):
+            continue
+        if not isinstance(r, dict):
+            continue
         i = r.get("id")
-        if not i:
+        if not valid_image_id(i):
             continue
         if r.get("removed"):
             out.pop(i, None)
@@ -53,8 +67,28 @@ def load_pool(pdir: Path, root: Path | None = None) -> dict[str, dict]:
     return out
 
 
+def valid_image_id(value) -> bool:
+    return isinstance(value, str) and POOL_ID.fullmatch(value) is not None and ".." not in value
+
+
+def image_asset(pdir: Path, item: dict) -> tuple[Path, Path]:
+    iid = item.get("id")
+    if not valid_image_id(iid):
+        raise ValueError("invalid image identifier")
+    return profile_asset(pdir, f"pool/images/{iid}.jpg")
+
+
 def image_path(pdir: Path, item: dict) -> Path:
-    return images_dir(pdir) / f"{item['id']}.jpg"
+    root, relative = image_asset(pdir, item)
+    return root / relative
+
+
+def image_bytes(pdir: Path, item: dict) -> bytes:
+    root, relative = image_asset(pdir, item)
+    data = read_file(root, relative, JPEG_LIMIT)
+    if not data.startswith(b"\xff\xd8\xff"):
+        raise ValueError("pool image is not a JPEG")
+    return data
 
 
 def normalize(data: bytes):
@@ -158,7 +192,8 @@ class PoolWriter:
             self.stats["near_duplicate"] += 1
             return None
         iid = iid or f"img-{sha[:12]}"
-        (images_dir(self.pdir) / f"{iid}.jpg").write_bytes(jpg)
+        root, relative = image_asset(self.pdir, {"id": iid})
+        write_file(root, relative, jpg)
         item = {"id": iid, "kind": meta.get("kind", self.kind), "src": meta.get("src", "dir"), "w": im.width,
                 "h": im.height, "sha1": sha, "dhash": f"{dh:016x}", "thumb": th, "added": now_iso()}
         for k in ("title", "source_url", "channel", "block_id", "origin", "image_url", "group"):

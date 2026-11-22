@@ -224,7 +224,8 @@ def _rewrite(pdir: Path, fn):
     f.write_text(json.dumps(S), encoding="utf-8")
 
 
-def test_one_layer_counter_and_chapter_scenes(pw, tmp_path):
+def test_one_layer_counter_and_chapter_scenes(pw, tmp_path, monkeypatch):
+    monkeypatch.setenv("SLOP_RENDER_TRUST_PROJECT_SCRIPTS", "1")
     hero = {"kind": "chart", "key": "B", "params": {"beats": 2}}
     empty = {"kind": "streamlines", "key": "B", "params": {"attractors": [{"x": 5, "y": 9}]}}       # unreadable: it draws nothing
     good = {"kind": "streamlines", "key": "B", "params": {"attractors": [[.3, .4, 1.4]], "seeds": 6}}  # a [u, v, k] row is fine

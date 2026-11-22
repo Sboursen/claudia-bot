@@ -321,7 +321,7 @@ def _encode(pdir: Path, frames: Path | None = None, out: Path | None = None, pro
         out = pdir / "out" / name
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    song = P.audio_path(pdir)
+    song = P.audio_path(pdir) if audio else None
     if audio and not song.is_file():
         raise SlopError(f"audio missing: {song} — add the song (slop song ingest) or pass --no-audio for a silent encode")
     lst = None
@@ -343,7 +343,7 @@ def _encode(pdir: Path, frames: Path | None = None, out: Path | None = None, pro
     # inside the last frame (306.4 s = 7353.6 frames at 24 fps) is padded with at most ONE frame of silence (apad
     # pad_dur) — -shortest alone cut the picture to the audio and the master came out one frame short; a song that is
     # really shorter than the film still cuts the picture, and verify says so
-    ain = ((["-ss", f"{first / fps:.6f}"] if first else []) + ["-i", str(song), "-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac",
+    ain = ((["-ss", f"{first / fps:.6f}"] if first else []) + [*P.RENDER_AUDIO_OPTIONS, "-i", str(song), "-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac",
            "-b:a", "256k", "-af", one_frame_pad(fps), "-shortest"]) if audio else ["-map", "0:v:0"]
     cmd = [ffmpeg, "-y", "-loglevel", "error", *vin, *ain, "-vf", VF, *TAGS, *PROFILES[profile], "-pix_fmt", "yuv420p",
            *vout, "-movflags", "+faststart", str(out)]
@@ -577,7 +577,8 @@ def _share(pdir: Path, vertical: bool = False, max_mib: float = SHARE_DEFAULT_MI
         vin, vf = ["-i", str(src["file"])], "scale=out_range=tv,format=yuv420p," + TAG_ONLY   # never full range out
     if song.is_file():
         st = int(src.get("start") or 0)                  # a stretch hears the song from its own first frame
-        ain, amap = [*(["-ss", f"{st / fps:.6f}"] if st else []), "-i", str(song)], ["-map", "0:v:0", "-map", "1:a:0"]
+        ain = [*(["-ss", f"{st / fps:.6f}"] if st else []), *P.RENDER_AUDIO_OPTIONS, "-i", str(song)]
+        amap = ["-map", "0:v:0", "-map", "1:a:0"]
     elif src["kind"] == "master":
         ain, amap = [], ["-map", "0:v:0", "-map", "0:a:0"]
         warns.append(f"audio taken from {src['file'].name} ({song.name} is missing)")

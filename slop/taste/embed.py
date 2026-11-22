@@ -23,9 +23,11 @@ costs nothing. Hosted APIs get display-size images (long side <= 1024), never or
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -33,7 +35,7 @@ import numpy as np
 
 from ..config import SlopError, cache_dir, slop_home
 from . import net
-from .pool import image_path, load_pool
+from .pool import image_bytes, image_path, load_pool
 from .store import emb_dir, read_json, write_json
 
 LOCAL_MODEL = "google/siglip2-base-patch16-naflex"   # Apache-2.0
@@ -231,10 +233,10 @@ class OpenRouterEmbedder:
 def make_embedder(provider: str = "auto", model: str | None = None, patches: int = PATCHES,
                   pdir: Path | None = None, threads: int | None = None, yes: bool = False):
     if provider == "auto":
-        provider = "local" if local_available() else ("openrouter" if os.environ.get("OPENROUTER_API_KEY") else "")
-        if not provider:
+        if not local_available():
             raise SlopError("no embedding provider: install torch + transformers (bin/setup.sh) for local SigLIP 2, "
                             "or set OPENROUTER_API_KEY and pass --provider openrouter")
+        provider = "local"
     if provider == "local":
         return LocalSiglip(model, patches, threads)
     if provider == "openrouter":
@@ -291,9 +293,14 @@ def embed_pool(pdir: Path, provider: str = "auto", model: str | None = None, pat
     pdir = Path(pdir)
     items = load_pool(pdir)
     ids, X, meta = load_store(pdir)
-    if embedder is None and provider == "auto" and meta.get("provider") and not reembed:
-        provider, model = meta["provider"], model or meta.get("model")
-        patches = int(meta.get("patches") or patches)
+    if embedder is None and meta.get("provider") and not reembed:
+        existing = meta["provider"]
+        if provider == "auto" and existing == "openrouter":
+            raise SlopError("this pool uses cloud embeddings. Pass --provider openrouter in an explicit embed run "
+                            "to upload more images, or pass --provider local --reembed to switch to local embeddings.")
+        if provider == existing or (provider == "auto" and existing == "local"):
+            provider, model = existing, model or meta.get("model")
+            patches = int(meta.get("patches") or patches)
     emb = embedder or make_embedder(provider, model, patches, pdir, threads, yes=yes)
     if yes and getattr(emb, "provider", "") == "openrouter":
         emb.yes = True
@@ -314,19 +321,6 @@ def embed_pool(pdir: Path, provider: str = "auto", model: str | None = None, pat
             check_budget(pdir, "openrouter", add_usd=est, yes=yes)
         out["est_usd"] = est
     new_ids, new_vecs = [], []
-    # per-image cache first
-    rest = []
-    for it in todo:
-        cf = _cache_file(emb.tag, it.get("sha1") or it["id"])
-        if cf.exists():
-            try:
-                new_ids.append(it["id"])
-                new_vecs.append(np.load(cf).astype("float32"))
-                out["cached"] += 1
-                continue
-            except Exception:  # noqa: BLE001
-                new_ids.pop()
-        rest.append(it)
     base_meta = {"provider": emb.provider, "model": emb.model, "tag": emb.tag,
                  "patches": patches if emb.provider == "local" else None,
                  "licence": LOCAL_LICENCE if emb.provider == "local" else "provider terms"}
@@ -345,22 +339,44 @@ def embed_pool(pdir: Path, provider: str = "auto", model: str | None = None, pat
         save_store(pdir, ids + new_ids, allX, m)
 
     t0 = time.monotonic()
-    for s in range(0, len(rest), BATCH):
-        part = rest[s:s + BATCH]
-        vs = emb.embed_images([image_path(pdir, it) for it in part])
-        for it, v in zip(part, vs):
-            if v is None:
-                out["failed"] += 1
-                continue
-            v = np.asarray(v, dtype="float32")
-            np.save(_cache_file(emb.tag, it.get("sha1") or it["id"]), v.astype("float16"))
-            new_ids.append(it["id"])
-            new_vecs.append(v)
-            out["computed"] += 1
+    for s in range(0, len(todo), BATCH):
+        part = todo[s:s + BATCH]
+        with tempfile.TemporaryDirectory(prefix="slop-taste-embed-") as stage:
+            queue = []
+            for it in part:
+                try:
+                    data = image_bytes(pdir, it)
+                except (OSError, ValueError):
+                    out["failed"] += 1
+                    continue
+                key = hashlib.sha1(data, usedforsecurity=False).hexdigest()  # compatibility with normalized JPEG cache
+                cf = _cache_file(emb.tag, key)
+                try:
+                    v = np.load(cf, allow_pickle=False).astype("float32")
+                except (OSError, ValueError):
+                    p = Path(stage) / f"{len(queue)}.jpg"
+                    p.write_bytes(data)
+                    queue.append((it["id"], p, cf))
+                else:
+                    new_ids.append(it["id"])
+                    new_vecs.append(v)
+                    out["cached"] += 1
+
+            if queue:
+                vectors = emb.embed_images([p for _, p, _ in queue])
+                for (iid, _, cf), v in zip(queue, vectors):
+                    if v is None:
+                        out["failed"] += 1
+                        continue
+                    v = np.asarray(v, dtype="float32")
+                    np.save(cf, v.astype("float16"))
+                    new_ids.append(iid)
+                    new_vecs.append(v)
+                    out["computed"] += 1
         done = s + len(part)
-        if done % SAVE_EVERY < BATCH or done == len(rest):
+        if done % SAVE_EVERY < BATCH or done == len(todo):
             flush()   # partial progress becomes visible to a running tap server
-            log(f"embedded {done}/{len(rest)} ({done / max(time.monotonic() - t0, 1e-6):.2f} img/s)")
+            log(f"embedded {done}/{len(todo)} ({done / max(time.monotonic() - t0, 1e-6):.2f} img/s)")
     flush()
     out["embedded"] = out["embedded_before"] + len(new_ids)
     out["seconds"] = round(time.monotonic() - t0, 1)

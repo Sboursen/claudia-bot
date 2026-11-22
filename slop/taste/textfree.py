@@ -71,6 +71,8 @@ cutoff and how it was chosen.
 """
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 from pathlib import Path
 
@@ -322,7 +324,8 @@ def synthetic_ridge(meta: dict, embedder):
     return _ridge_fit(V, y)
 
 
-def pool_probe(Xn: np.ndarray, paths: list, keys: list[str], zscores: np.ndarray, meta: dict, embedder) -> dict:
+def pool_probe(Xn: np.ndarray, paths: list, keys: list[str], zscores: np.ndarray, meta: dict, embedder,
+               *, image_reader=None) -> dict:
     """fit the paired probe on the pool -> {w, b, cutoff, k, loo_auc, ...}; raises ValueError when it cannot"""
     from PIL import Image
     from ..config import cache_dir
@@ -346,24 +349,33 @@ def pool_probe(Xn: np.ndarray, paths: list, keys: list[str], zscores: np.ndarray
                          f"{BG_TIERS[-1][0]:.0%} must hold >= {PROBE_MIN}; {POOL_MIN}+ images)")
     bg = cand[:: max(1, len(cand) // PROBE_MAX)][:PROBE_MAX]
     idir = cache_dir("textprobe") / f"pool-v{POOL_PROBE_VERSION}"
-    vdir = cache_dir("embed") / meta["tag"] / f"letter-v{POOL_PROBE_VERSION}"
+    tag = str(getattr(embedder, "tag", meta["tag"]))
+    if not tag or tag in (".", "..") or any(c in tag for c in "/\\:"):
+        raise ValueError("invalid embedding cache tag")
+    vdir = cache_dir("embed") / tag / f"letter-v{POOL_PROBE_VERSION}"
     idir.mkdir(parents=True, exist_ok=True)
     vdir.mkdir(parents=True, exist_ok=True)
     vecs: dict[int, np.ndarray] = {}
     todo = []
     for k in bg:
         kind, seed = _key_kind_seed(keys[k])
-        vf = vdir / f"{keys[k]}-{kind}.npy"
+        key = hashlib.sha256(keys[k].encode("utf-8")).hexdigest()
+        vf = vdir / f"{key}-{kind}.npy"
         if vf.exists():
             try:
                 vecs[k] = np.load(vf).astype("float32")
                 continue
             except (OSError, ValueError):
                 pass
-        img = idir / f"{keys[k]}-{kind}.jpg"
+        img = idir / f"{key}-{kind}.jpg"
         if not img.exists():
             tmp = img.with_name(img.stem + ".tmp.jpg")
-            render_lettered(Image.open(paths[k]), kind, seed).save(tmp, quality=88)
+            try:
+                source = io.BytesIO(image_reader(k)) if image_reader is not None else paths[k]
+                with Image.open(source) as image:
+                    render_lettered(image, kind, seed).save(tmp, quality=88)
+            except (OSError, ValueError):
+                continue
             tmp.replace(img)
         todo.append((k, img, vf))
     for s in range(0, len(todo), 8):
@@ -426,7 +438,7 @@ def assess(pdir, ids: list[str], Xn: np.ndarray, items: dict, meta: dict, embedd
            yes: bool = False) -> tuple[np.ndarray, dict]:
     """-> (a text score for every pool image, the cutoff info); refs are the images with score < info["cutoff"].
     info also carries the score in use, its range in this pool and a suggested looser --text-max."""
-    from .pool import image_path
+    from .pool import image_bytes, image_path
     z = text_free_scores(Xn, meta, embedder=embedder, pdir=pdir, yes=yes)
     paths = [image_path(pdir, items[i]) if i in items else None for i in ids]
     keys = [str((items.get(i) or {}).get("sha1") or i) for i in ids]
@@ -435,7 +447,7 @@ def assess(pdir, ids: list[str], Xn: np.ndarray, items: dict, meta: dict, embedd
         if emb is None:
             from .embed import text_embedder_for
             emb = text_embedder_for(meta, pdir, yes=yes)
-        pr = pool_probe(Xn, paths, keys, z, meta, emb)
+        pr = pool_probe(Xn, paths, keys, z, meta, emb, image_reader=lambda k: image_bytes(pdir, items[ids[k]]))
     except Exception as e:  # noqa: BLE001 — a small pool / copies that cannot be embedded: the zero-shot fallback
         from ..config import SlopError
         if isinstance(e, SlopError) and ("budget" in str(e) or "--yes" in str(e)):

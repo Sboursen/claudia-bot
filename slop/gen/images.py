@@ -48,6 +48,8 @@ from .. import ledger
 from ..config import SlopError, load_project
 from . import models as reg
 from .openrouter import OpenRouter, ProviderError, data_url
+from .project_inputs import (MAX_TEXT_BYTES, candidate_directory, project_path, read_project_file,
+                             stage_references, write_candidate)
 
 DEFAULT_MODEL = "openai/gpt-image-2"
 STOP_BATCH = ("credits", "key_limit", "auth", "rate_limited", "server", "network", "unknown_outcome")
@@ -114,7 +116,7 @@ def ref_id(pdir: Path, s: str) -> str:
 
 def _cand_files(pdir: Path, plate: str) -> dict[int, Path]:
     """plates/cands/<plate>/<k>.<image ext> (any case) by k."""
-    d = Path(pdir) / "plates" / "cands" / plate.split("~")[0]
+    d = candidate_directory(pdir, plate.split("~")[0])
     return {int(p.stem): p for p in sorted(d.iterdir()) if p.stem.isdigit() and p.suffix.lower() in IMG_EXTS} \
         if d.is_dir() else {}
 
@@ -156,13 +158,16 @@ def resolve_ref(pdir: Path, ref: str, in_project: bool = False) -> dict:
         return {"ref": u, "src": u, "id": ref_id(pdir, u), "plate": None, "k": None}
     p = Path(r).expanduser()
     here = [p, Path(pdir) / p]
-    for f in ([p] if p.is_absolute() else here[1:] if in_project else here):
+    candidates = [project_path(pdir, p)] if in_project else [p] if p.is_absolute() else here
+    for f in candidates:
         if f.is_file():
-            src = str(f.resolve())
-            rid = ref_id(pdir, src)
+            if in_project and f.suffix.lower() not in IMG_EXTS:
+                raise SlopError("an image job reference must be a PNG, JPEG or WebP file")
+            src = str(f if in_project else f.resolve())
+            rid = f.relative_to(Path(pdir).resolve()).as_posix() if in_project else ref_id(pdir, src)
             mc = re.fullmatch(r"plates/cands/([^/]+)/(\d+)\.\w+", rid)      # a candidate named by its path
             return {"ref": r, "src": src, "id": rid, "plate": mc.group(1) if mc else None,
-                    "k": int(mc.group(2)) if mc else None}
+                    "k": int(mc.group(2)) if mc else None, **({"project_file": True} if in_project else {})}
     m = REF_RE.match(r)
     if not m or Path(r).suffix.lower() in IMG_EXTS:
         raise SlopError(f"--ref {r}: no such image file (looked in "
@@ -172,6 +177,8 @@ def resolve_ref(pdir: Path, ref: str, in_project: bool = False) -> dict:
     base = plate.split("~")[0]
     if k is None and "~" in plate and plate.split("~", 1)[1].isdigit():
         k = int(plate.split("~", 1)[1])                         # a variant key names its candidate
+    if in_project:
+        candidate_directory(pdir, base)
     have = _cand_ks(pdir, base)
     if not have:
         raise SlopError(f"--ref {r}: not an image file, and plates/cands/{base}/ has no candidates (`slop plates "
@@ -179,8 +186,10 @@ def resolve_ref(pdir: Path, ref: str, in_project: bool = False) -> dict:
     if k is None:
         picks = {}
         try:
-            picks = json.loads((Path(pdir) / "plates" / "picks.json").read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            path = Path("plates") / "picks.json"
+            picks = json.loads(read_project_file(pdir, path, limit=MAX_TEXT_BYTES) if in_project else
+                               (Path(pdir) / path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
             pass
         pk = picks.get(plate) if isinstance(picks, dict) else None
         if not isinstance(pk, dict) or pk.get("cand_k") is None:
@@ -191,8 +200,11 @@ def resolve_ref(pdir: Path, ref: str, in_project: bool = False) -> dict:
     f = cand_file(pdir, base, k)
     if f is None:
         raise SlopError(f"--ref {r}: {base} has no candidate #{k} (has {', '.join('#' + str(x) for x in have)})")
-    src = str(f.resolve())
-    return {"ref": r, "src": src, "id": ref_id(pdir, src), "plate": base, "k": k}
+    path = project_path(pdir, f.absolute()) if in_project else f.resolve()
+    src = str(path)
+    rid = path.relative_to(Path(pdir).resolve()).as_posix() if in_project else ref_id(pdir, src)
+    return {"ref": r, "src": src, "id": rid, "plate": base, "k": k,
+            **({"project_file": True} if in_project else {})}
 
 
 def resolve_refs(pdir: Path, refs: list[str] | None, in_project: bool = False) -> list[dict]:
@@ -296,17 +308,19 @@ def build_body(model: str, prompt: str, *, aspect_ratio: str | None = None, reso
 def generate(pdir: Path, *, model: str, prompt: str, out_dir: Path | None = None, out: Path | None = None,
              aspect_ratio: str | None = None, resolution: str | None = None, quality: str | None = None, n: int = 1,
              refs: list[str] | None = None, seed: int | None = None, yes: bool = False, client: OpenRouter | None = None,
-             est_usd: float | None = None, meta: dict | None = None) -> dict:
+             est_usd: float | None = None, meta: dict | None = None,
+             resolved_refs: list[dict] | None = None, project_output: bool = False) -> dict:
     if out is None and out_dir is None:
         raise SlopError("say where the image goes: --plate NAME (plates/cands/NAME/<k>.png) or --out FILE")
-    rs = resolve_refs(pdir, refs)                                 # files, URLs or PLATE[:K]; refused before any spend
+    rs = resolve_refs(pdir, refs) if resolved_refs is None else resolved_refs
     check_refs(model, len(rs))
     client = client or OpenRouter()
     est = est_usd if est_usd is not None else reg.estimate_image(model, resolution or "1K", quality, n, len(rs),
                                                                  prompt=prompt)
     ledger.check_budget(pdir, "openrouter", add_usd=est, yes=yes)
-    body = build_body(model, prompt, aspect_ratio=aspect_ratio, resolution=resolution, quality=quality, n=n,
-                      refs=[r["src"] for r in rs], seed=seed)
+    with stage_references(pdir, [r["src"] for r in rs], [r["src"] for r in rs if r.get("project_file")]) as staged:
+        body = build_body(model, prompt, aspect_ratio=aspect_ratio, resolution=resolution, quality=quality, n=n,
+                          refs=staged, seed=seed)
     try:
         resp = client.post("/images", body, where="images", retry_network=False)
     except ProviderError as e:
@@ -346,9 +360,12 @@ def generate(pdir: Path, *, model: str, prompt: str, out_dir: Path | None = None
             dst = o if len(data) == 1 else o.with_name(f"{o.stem}-{i + 1}{o.suffix or ext}")
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.with_suffix(".json").write_text(json.dumps(side_doc, indent=1), encoding="utf-8")
+            dst.write_bytes(raw)
+        elif project_output:
+            dst = write_candidate(pdir, Path(out_dir), ext, raw, side_doc)
         else:
             dst = reserve(Path(out_dir), ext, side_doc)            # claims <k>.json (the sidecar) before the image
-        dst.write_bytes(raw)
+            dst.write_bytes(raw)
         files.append(dst)
     row = ledger.record(pdir, provider="openrouter", model=model, kind="image",
                         est_usd=float(real) if real is not None else est,
@@ -361,11 +378,15 @@ def generate(pdir: Path, *, model: str, prompt: str, out_dir: Path | None = None
 
 # ------------------------------------------------------------------------------------------------ batch (jobs.json)
 def load_jobs(pdir: Path, path: Path) -> list[dict]:
-    if not path.is_file():
-        raise SlopError(f"no jobs file {path}: write it with `slop plates book` (it lists the API plate jobs), then re-run")
+    path = Path(path).absolute()
+    project = Path(pdir)
+    in_project = path.is_relative_to(project.absolute()) or path.is_relative_to(project.resolve())
+    root, relative = (project, path) if in_project else (path.parent, Path(path.name))
     try:
-        doc = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
+        doc = json.loads(read_project_file(root, relative, limit=MAX_TEXT_BYTES).decode("utf-8"))
+    except FileNotFoundError as e:
+        raise SlopError(f"no jobs file {path}: write it with `slop plates book` (it lists the API plate jobs), then re-run") from e
+    except (json.JSONDecodeError, UnicodeError) as e:
         raise SlopError(f"{path} is not valid JSON ({e}); re-write it with `slop plates book`") from e
     jobs = doc.get("jobs") if isinstance(doc, dict) else doc
     if not isinstance(jobs, list) or not jobs:
@@ -378,18 +399,25 @@ def load_jobs(pdir: Path, path: Path) -> list[dict]:
                                           or not all(isinstance(x, str) and x.strip() for x in j["refs"])):
             raise SlopError(f"{path}: job {j['plate']}: \"refs\" must be a list of image files, URLs or PLATE[:K] "
                             "strings; re-write the file with `slop plates book`")
+        candidate_directory(pdir, j["plate"])
         out.append(j)
     return out
 
 
 def job_prompt(pdir: Path, job: dict) -> str:
-    if (job.get("prompt") or "").strip():
-        return job["prompt"].strip()
+    prompt = job.get("prompt")
+    if isinstance(prompt, str) and prompt.strip():
+        return prompt.strip()
     pf = job.get("prompt_file")
     if pf:
-        p = Path(pf) if Path(pf).is_absolute() else pdir / pf
-        if p.is_file():
-            return p.read_text(encoding="utf-8").strip()
+        if not isinstance(pf, str):
+            raise SlopError("image job prompt_file must be a project file name")
+        try:
+            return read_project_file(pdir, pf, limit=MAX_TEXT_BYTES).decode("utf-8").strip()
+        except FileNotFoundError:
+            pass
+        except UnicodeError as e:
+            raise SlopError("image job prompt_file must contain UTF-8 text") from e
     raise SlopError(f"job {job.get('plate')} has no prompt (neither 'prompt' nor a readable 'prompt_file'): write the plate's "
                     "prompt on the board and re-run `slop plates book`")
 
@@ -410,14 +438,14 @@ def made_for(pdir: Path, plate: str, prompt: str, model: str, *, quality=ANY, re
     """images in plates/cands/<plate>/ already made from this exact prompt with this model — and, when given, this
     quality, resolution, aspect ratio and set of reference images (their sidecars say so)."""
     want_refs = None if refs is ANY else _ref_set(pdir, refs)
-    d = pdir / "plates" / "cands" / plate
+    d = candidate_directory(pdir, plate)
     out = []
     if not d.is_dir():
         return out
     for side in sorted(d.glob("*.json"), key=lambda p: (len(p.stem), p.stem)):
         try:
-            s = json.loads(side.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            s = json.loads(read_project_file(pdir, side, limit=MAX_TEXT_BYTES))
+        except (OSError, ValueError):
             continue
         if not isinstance(s, dict) or s.get("model") != model or (s.get("prompt") or "").strip() != prompt.strip():
             continue
@@ -426,14 +454,14 @@ def made_for(pdir: Path, plate: str, prompt: str, model: str, *, quality=ANY, re
             continue
         if want_refs is not None and _ref_set(pdir, s.get("refs")) != want_refs:
             continue
-        img = next((side.with_suffix(e) for e in IMG_EXTS if side.with_suffix(e).is_file()), None)
+        img = next((path for ext in IMG_EXTS if not (path := side.with_suffix(ext)).is_symlink() and path.is_file()), None)
         if img:
             out.append(img)
     return out
 
 
 def any_candidates(pdir: Path, plate: str) -> bool:
-    d = pdir / "plates" / "cands" / plate
+    d = candidate_directory(pdir, plate)
     return d.is_dir() and any(p.suffix.lower() in IMG_EXTS for p in d.iterdir())
 
 
@@ -469,6 +497,7 @@ def plan_jobs(pdir: Path, jobs: list[dict], *, only: list[str] | None = None, mi
     taken: dict[tuple, int] = {}            # images already made, shared in file order by jobs with the same request
     for i, j in enumerate(jobs):
         plate = j["plate"]
+        candidate_directory(pdir, plate)
         m = model or j.get("model") or pmodel or DEFAULT_MODEL
         q = quality or j.get("quality")
         res = resolution or j.get("resolution")
@@ -489,6 +518,7 @@ def plan_jobs(pdir: Path, jobs: list[dict], *, only: list[str] | None = None, mi
             rs = _job_refs(pdir, j, refs, m)
             ids = [r["id"] for r in rs]
             row["refs"], row["ref_src"] = ids, [r["src"] for r in rs]
+            row["resolved_refs"] = rs
             if j.get("anchor"):
                 row["anchor"] = j["anchor"]
             key = (plate, m, prompt.strip(), q or None, res or None, asp, tuple(sorted(ids)))
@@ -533,7 +563,7 @@ def _ref_arg(pdir: Path, r: str) -> str:
 
 def _public_row(r: dict) -> dict:
     """a plan/result row for --json: no prompt text, no absolute source paths (the ids say which images)."""
-    return {k: v for k, v in r.items() if k not in ("prompt", "ref_src")}
+    return {k: v for k, v in r.items() if k not in ("prompt", "ref_src", "resolved_refs", "project_ref_src")}
 
 
 def run_jobs(pdir: Path, jobs_file: Path, *, only: list[str] | None = None, missing: bool = False, yes: bool = False,
@@ -597,10 +627,10 @@ def run_jobs(pdir: Path, jobs_file: Path, *, only: list[str] | None = None, miss
         if stop:
             return {**r, "status": "not run", "error": f"batch stopped: {stop.get('why')}"}
         try:
-            g = generate(pdir, model=r["model"], prompt=r["prompt"], out_dir=pdir / "plates" / "cands" / r["plate"],
+            g = generate(pdir, model=r["model"], prompt=r["prompt"], out_dir=candidate_directory(pdir, r["plate"]),
                          aspect_ratio=r["aspect"], resolution=r["resolution"], quality=r["quality"], n=r["need"],
-                         refs=r.get("ref_src") or None, seed=seed, yes=True, client=client, est_usd=r["est_usd"],
-                         meta={"job": r["plate"], "jobs_file": rel_jobs})
+                         resolved_refs=r["resolved_refs"], seed=seed, yes=True, client=client, est_usd=r["est_usd"],
+                         meta={"job": r["plate"], "jobs_file": rel_jobs}, project_output=True)
             return {**r, "status": "ok", "files": g["files"], "cost_usd": g["cost_usd"]}
         except ProviderError as e:
             if e.status in STOP_BATCH:

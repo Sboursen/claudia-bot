@@ -223,6 +223,11 @@ starts it from a copy); `slop -p <name> taste use --profile=user --merge` adds a
 profile. Tokens, verdicts on this video's choices and
 `look-bible.md` stay in each project.
 
+Older profile copies may contain hard-linked images. Re-add those images from trusted originals before preview or
+embedding. Rebuild older font sessions with font setup to stage the frame and fonts. Recorded votes remain available.
+Detached serving honors `--no-embed`. Sending pool images to OpenRouter requires a separate, explicit embed run
+with `--provider openrouter`.
+
 ### 2.5 Style frames (the most valuable two minutes of the session)
 
 1. From the draft tokens, render **3 style frames** that differ on the **riskiest axes** for this project: footage
